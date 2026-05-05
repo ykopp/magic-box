@@ -1,13 +1,13 @@
-import os
-import sys
-import shutil
-import time
-import wave
 import gc
+import argparse
+import os
 import re
+import shutil
 import subprocess
+import sys
+import time
 import warnings
-from datetime import datetime
+from pathlib import Path
 
 # Suppress harmless library warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -22,42 +22,55 @@ except ImportError:
     print("Run: source .venv/bin/activate")
     sys.exit(1)
 
+from utils import (
+    SAMPLE_RATE,
+    convert_audio_if_needed,
+    get_smart_path,
+    make_output_filename,
+    model_cache,
+    split_text,
+    _safe_remove,
+)
+
+# ---------------------------------------------------------------------------
 # Configuration
+# ---------------------------------------------------------------------------
 BASE_OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
 MODELS_DIR = os.path.join(os.getcwd(), "models")
+USER_MODELS_DIR = os.path.join(str(Path.home()), "podcast_generator_models")
 VOICES_DIR = os.path.join(os.getcwd(), "voices")
 
-# Settings
 AUTO_PLAY = True
-SAMPLE_RATE = 24000
-FILENAME_MAX_LEN = 20
 
-# Model Definitions
 MODELS = {
     # Pro (1.7B)
-    "1": {"name": "Custom Voice", "folder": "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit", "mode": "custom", "output_subfolder": "CustomVoice"},
-    "2": {"name": "Voice Design", "folder": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", "mode": "design", "output_subfolder": "VoiceDesign"},
-    "3": {"name": "Voice Cloning", "folder": "Qwen3-TTS-12Hz-1.7B-Base-8bit", "mode": "clone_manager", "output_subfolder": "Clones"},
+    "1": {"name": "Custom Voice",  "folder": "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit", "mode": "custom",        "output_subfolder": "CustomVoice"},
+    "2": {"name": "Voice Design",  "folder": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", "mode": "design",        "output_subfolder": "VoiceDesign"},
+    "3": {"name": "Voice Cloning", "folder": "Qwen3-TTS-12Hz-1.7B-Base-8bit",        "mode": "clone_manager", "output_subfolder": "Clones"},
     # Lite (0.6B)
-    "4": {"name": "Custom Voice", "folder": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "mode": "custom", "output_subfolder": "CustomVoice"},
-    "5": {"name": "Voice Design", "folder": "Qwen3-TTS-12Hz-0.6B-VoiceDesign-8bit", "mode": "design", "output_subfolder": "VoiceDesign"},
-    "6": {"name": "Voice Cloning", "folder": "Qwen3-TTS-12Hz-0.6B-Base-8bit", "mode": "clone_manager", "output_subfolder": "Clones"},
+    "4": {"name": "Custom Voice",  "folder": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "mode": "custom",        "output_subfolder": "CustomVoice"},
+    "5": {"name": "Voice Design",  "folder": "Qwen3-TTS-12Hz-0.6B-VoiceDesign-8bit", "mode": "design",        "output_subfolder": "VoiceDesign"},
+    "6": {"name": "Voice Cloning", "folder": "Qwen3-TTS-12Hz-0.6B-Base-8bit",        "mode": "clone_manager", "output_subfolder": "Clones"},
 }
 
 SPEAKER_MAP = {
     "English": ["Ryan", "Aiden", "Ethan", "Chelsie", "Serena", "Vivian"],
     "Chinese": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"],
     "Japanese": ["Ono_Anna"],
-    "Korean": ["Sohee"]
+    "Korean": ["Sohee"],
 }
 
 EMOTION_EXAMPLES = [
     "Sad and crying, speaking slowly",
     "Excited and happy, speaking very fast",
     "Angry and shouting",
-    "Whispering quietly"
+    "Whispering quietly",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def flush_input():
     try:
@@ -67,37 +80,16 @@ def flush_input():
         pass
 
 
-def clean_memory():
-    gc.collect()
-
-
 def make_temp_dir():
     return f"temp_{int(time.time())}"
 
 
-def get_smart_path(folder_name):
-    full_path = os.path.join(MODELS_DIR, folder_name)
-    if not os.path.exists(full_path):
-        return None
-
-    snapshots_dir = os.path.join(full_path, "snapshots")
-    if os.path.exists(snapshots_dir):
-        subfolders = [f for f in os.listdir(snapshots_dir) if not f.startswith('.')]
-        if subfolders:
-            return os.path.join(snapshots_dir, subfolders[0])
-
-    return full_path
-
-
-def save_audio_file(temp_folder, subfolder, text_snippet):
+def save_audio_file(temp_folder: str, subfolder: str, text_snippet: str):
     save_path = os.path.join(BASE_OUTPUT_DIR, subfolder)
     os.makedirs(save_path, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%H-%M-%S")
-    clean_text = re.sub(r'[^\w\s-]', '', text_snippet)[:FILENAME_MAX_LEN].strip().replace(' ', '_') or "audio"
-    filename = f"{timestamp}_{clean_text}.wav"
+    filename = make_output_filename(text_snippet)    # YYYYMMDD_HHMMSS_<text>.wav
     final_path = os.path.join(save_path, filename)
-
     source_file = os.path.join(temp_folder, "audio_000.wav")
 
     if os.path.exists(source_file):
@@ -107,8 +99,12 @@ def save_audio_file(temp_folder, subfolder, text_snippet):
         if AUTO_PLAY:
             print("Playing...")
             try:
-                subprocess.run(["afplay", final_path], check=False, 
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    ["afplay", final_path],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except FileNotFoundError:
                 pass
 
@@ -116,7 +112,7 @@ def save_audio_file(temp_folder, subfolder, text_snippet):
         shutil.rmtree(temp_folder, ignore_errors=True)
 
 
-def clean_path(user_input):
+def clean_path(user_input: str) -> str:
     path = user_input.strip()
     if len(path) > 1 and path[0] in ["'", '"'] and path[-1] == path[0]:
         path = path[1:-1]
@@ -126,14 +122,14 @@ def clean_path(user_input):
 def get_safe_input(prompt="\nEnter text (or drag .txt file): "):
     try:
         raw_input = input(prompt).strip()
-        if raw_input.lower() in ['exit', 'quit', 'q']:
+        if raw_input.lower() in ["exit", "quit", "q"]:
             return None
 
         clean_p = clean_path(raw_input)
         if os.path.exists(clean_p) and clean_p.endswith(".txt"):
             print(f"Reading from: {os.path.basename(clean_p)}")
             try:
-                with open(clean_p, 'r', encoding='utf-8') as f:
+                with open(clean_p, "r", encoding="utf-8") as f:
                     return f.read().strip()
             except IOError as e:
                 print(f"Error reading file: {e}")
@@ -145,41 +141,16 @@ def get_safe_input(prompt="\nEnter text (or drag .txt file): "):
         return None
 
 
-def convert_audio_if_needed(input_path):
-    if not os.path.exists(input_path):
-        return None
-
-    filename = os.path.basename(input_path)
-    name, ext = os.path.splitext(filename)
-
-    if ext.lower() == ".wav":
-        try:
-            with wave.open(input_path, 'rb') as f:
-                if f.getnchannels() > 0:
-                    return input_path
-        except wave.Error:
-            pass
-
-    temp_wav = os.path.join(os.getcwd(), f"temp_convert_{int(time.time())}.wav")
-    print(f"Converting '{ext}' to WAV...")
-
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", input_path, 
-           "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", temp_wav]
-
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        return temp_wav
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: Could not convert audio. Is ffmpeg installed?")
-        return None
-
-
 def get_saved_voices():
     if not os.path.exists(VOICES_DIR):
         return []
     voices = [f.replace(".wav", "") for f in os.listdir(VOICES_DIR) if f.endswith(".wav")]
     return sorted(voices)
 
+
+# ---------------------------------------------------------------------------
+# Voice enrollment
+# ---------------------------------------------------------------------------
 
 def enroll_new_voice():
     print("\n--- Enroll New Voice ---")
@@ -189,7 +160,16 @@ def enroll_new_voice():
     if not name:
         return
 
-    safe_name = re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')
+    safe_name = re.sub(r"[^\w\s-]", "", name).strip().replace(" ", "_")
+
+    # B4 fix: check for name collision
+    target_wav = os.path.join(VOICES_DIR, f"{safe_name}.wav")
+    if os.path.exists(target_wav):
+        print(f"⚠ Voice '{safe_name}' already exists.")
+        ans = input("Overwrite? [y/N] ").strip().lower()
+        if ans != "y":
+            print("Cancelled.")
+            return
 
     ref_input = input("2. Drag & Drop Reference File: ").strip()
     raw_path = clean_path(ref_input)
@@ -199,6 +179,7 @@ def enroll_new_voice():
         flush_input()
         return
 
+    # B1 fix: convert_audio_if_needed now uses tempfile internally
     clean_wav_path = convert_audio_if_needed(raw_path)
     if not clean_wav_path:
         return
@@ -206,43 +187,61 @@ def enroll_new_voice():
     print("3. Transcript (important for quality):")
     ref_text = input("   Type EXACTLY what the audio says: ").strip()
 
-    if not os.path.exists(VOICES_DIR):
-        os.makedirs(VOICES_DIR)
-
-    target_wav = os.path.join(VOICES_DIR, f"{safe_name}.wav")
+    os.makedirs(VOICES_DIR, exist_ok=True)
     target_txt = os.path.join(VOICES_DIR, f"{safe_name}.txt")
 
     shutil.copy(clean_wav_path, target_wav)
-    with open(target_txt, "w", encoding='utf-8') as f:
+    with open(target_txt, "w", encoding="utf-8") as f:
         f.write(ref_text)
 
-    if clean_wav_path != raw_path and os.path.exists(clean_wav_path):
-        os.remove(clean_wav_path)
+    # Clean up temp converted file
+    if clean_wav_path != raw_path:
+        _safe_remove(clean_wav_path)
 
     print(f"Voice saved as '{safe_name}'")
 
 
-def run_custom_session(model_key):
+# ---------------------------------------------------------------------------
+# Session runners
+# ---------------------------------------------------------------------------
+
+def _load_model_for_session(model_key: str):
+    """Load (or reuse cached) model for a session."""
     info = MODELS[model_key]
     model_path = get_smart_path(info["folder"])
     if not model_path:
-        print("Error: Model not found.")
-        return
+        print(f"Error: Model folder '{info['folder']}' not found in models/ or ~/podcast_generator_models/")
+        return None, None
+
+    resolved = str(Path(model_path).resolve())
+    cached = model_cache.get(resolved)
+    if cached is not None:
+        print(f"\n(using cached {info['name']})")
+        return cached, model_path
 
     print(f"\nLoading {info['name']}...")
     try:
-        model = load_model(model_path)
+        m = load_model(model_path)
+        model_cache.set(resolved, m)
+        return m, model_path
     except Exception as e:
         print(f"Load failed: {e}")
+        return None, None
+
+
+def run_custom_session(model_key: str):
+    m, _ = _load_model_for_session(model_key)
+    if m is None:
         return
 
+    info = MODELS[model_key]
     print(f"\n--- {info['name']} ---")
     speaker = "Vivian"
     all_speakers = [n for names in SPEAKER_MAP.values() for n in names]
     print("Available Speakers: " + ", ".join(all_speakers))
 
     user_choice = input("\nSelect Speaker (Name): ").strip()
-    for lang, names in SPEAKER_MAP.items():
+    for names in SPEAKER_MAP.values():
         if user_choice in names:
             speaker = user_choice
             break
@@ -271,28 +270,24 @@ def run_custom_session(model_key):
         print("Generating...")
         temp_dir = make_temp_dir()
         try:
-            generate_audio(model=model, text=text, voice=speaker, 
-                         instruct=base_instruct, speed=speed, output_path=temp_dir)
+            generate_audio(
+                model=m, text=text, voice=speaker,
+                instruct=base_instruct, speed=speed, output_path=temp_dir,
+            )
             save_audio_file(temp_dir, info["output_subfolder"], text)
         except Exception as e:
             print(f"Error: {e}")
-    clean_memory()
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+    gc.collect()
 
 
-def run_design_session(model_key):
+def run_design_session(model_key: str):
+    m, _ = _load_model_for_session(model_key)
+    if m is None:
+        return
+
     info = MODELS[model_key]
-    model_path = get_smart_path(info["folder"])
-    if not model_path:
-        print("Error: Model not found.")
-        return
-
-    print(f"\nLoading {info['name']}...")
-    try:
-        model = load_model(model_path)
-    except Exception as e:
-        print(f"Load failed: {e}")
-        return
-
     print(f"\n--- {info['name']} ---")
     instruct = input("Describe the voice: ").strip()
     if not instruct:
@@ -305,14 +300,18 @@ def run_design_session(model_key):
         print("Generating...")
         temp_dir = make_temp_dir()
         try:
-            generate_audio(model=model, text=text, instruct=instruct, output_path=temp_dir)
+            generate_audio(
+                model=m, text=text, instruct=instruct, output_path=temp_dir,
+            )
             save_audio_file(temp_dir, info["output_subfolder"], text)
         except Exception as e:
             print(f"Error: {e}")
-    clean_memory()
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+    gc.collect()
 
 
-def run_clone_manager(model_key):
+def run_clone_manager(model_key: str):
     print("\n--- Voice Cloning Manager ---")
     print("  1. Pick from Saved Voices")
     print("  2. Enroll New Voice")
@@ -326,19 +325,11 @@ def run_clone_manager(model_key):
     if sub_choice == "4":
         return
 
+    m, _ = _load_model_for_session(model_key)
+    if m is None:
+        return
+
     info = MODELS[model_key]
-    model_path = get_smart_path(info["folder"])
-    if not model_path:
-        print("Error: Model not found.")
-        return
-
-    print("\nLoading Base Model...")
-    try:
-        model = load_model(model_path)
-    except Exception as e:
-        print(f"Load failed: {e}")
-        return
-
     ref_audio, ref_text = None, None
 
     if sub_choice == "1":
@@ -358,7 +349,7 @@ def run_clone_manager(model_key):
             ref_audio = os.path.join(VOICES_DIR, f"{name}.wav")
             txt_path = os.path.join(VOICES_DIR, f"{name}.txt")
             if os.path.exists(txt_path):
-                with open(txt_path, 'r', encoding='utf-8') as f:
+                with open(txt_path, "r", encoding="utf-8") as f:
                     ref_text = f.read().strip()
             print(f"Loaded: {name}")
         except (ValueError, IndexError):
@@ -372,7 +363,6 @@ def run_clone_manager(model_key):
         if not ref_audio:
             return
         ref_text = input("   Transcript (Optional): ").strip() or "."
-
     else:
         return
 
@@ -383,33 +373,42 @@ def run_clone_manager(model_key):
         print("Cloning...")
         temp_dir = make_temp_dir()
         try:
-            generate_audio(model=model, text=text, ref_audio=ref_audio, 
-                         ref_text=ref_text, output_path=temp_dir)
+            generate_audio(
+                model=m, text=text,
+                ref_audio=ref_audio, ref_text=ref_text,
+                output_path=temp_dir,
+            )
             save_audio_file(temp_dir, info["output_subfolder"], text)
         except Exception as e:
             print(f"Error: {e}")
-    clean_memory()
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+    gc.collect()
 
 
-def main_menu():
+# ---------------------------------------------------------------------------
+# Main menu
+# ---------------------------------------------------------------------------
+
+def print_main_menu():
     print("\n" + "=" * 40)
     print(" Qwen3-TTS Manager")
     print("=" * 40)
-    
     print("\n  Pro Models (1.7B - Best Quality)")
     print("  ---------------------------------")
     print("  1. Custom Voice")
     print("  2. Voice Design")
-    print("  3. Voice Cloning")
-    
+    print("  3. Voice Cloning  ← 声音克隆（播客推荐）")
     print("\n  Lite Models (0.6B - Faster)")
     print("  ---------------------------")
     print("  4. Custom Voice")
     print("  5. Voice Design")
     print("  6. Voice Cloning")
-    
     print("\n  q. Exit")
 
+
+def main_menu():
+    print_main_menu()
     choice = input("\nSelect: ").strip().lower()
 
     if choice == "q":
@@ -421,7 +420,6 @@ def main_menu():
         return
 
     mode = MODELS[choice]["mode"]
-
     if mode == "custom":
         run_custom_session(choice)
     elif mode == "design":
@@ -430,10 +428,39 @@ def main_menu():
         run_clone_manager(choice)
 
 
-if __name__ == "__main__":
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Qwen3-TTS 交互式管理器。长文生成建议使用 podcast_generator.py。"
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="显示交互菜单中的模型选项后退出",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.list_models:
+        print_main_menu()
+        return 0
+
+    if not sys.stdin.isatty():
+        print(
+            "main.py 是交互式菜单，非交互环境请改用 podcast_generator.py 或传入 --list-models。",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
         while True:
             main_menu()
     except KeyboardInterrupt:
         print("\nExiting...")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

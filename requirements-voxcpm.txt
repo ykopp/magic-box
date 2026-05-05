@@ -1,0 +1,7 @@
+# Optional, isolated VoxCPM experiment dependencies.
+#
+# Do not install this into the default Qwen/MLX production environment unless
+# you explicitly want to test backend=voxcpm. These PyTorch packages are larger
+# and have a different compatibility surface from the Apple Silicon MLX path.
+
+-e ../VoxCPM

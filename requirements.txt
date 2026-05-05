@@ -1,5 +1,5 @@
 anyio==4.12.1
-audioop-lts==0.2.2
+audioop-lts==0.2.2; python_version >= "3.13"
 audioread==3.1.0
 blobfile==3.1.0
 certifi==2026.1.4
@@ -9,6 +9,7 @@ click==8.3.1
 decorator==5.2.1
 filelock==3.20.3
 fsspec==2026.1.0
+gradio>=6.5,<7
 h11==0.16.0
 hf-xet==1.2.0
 httpcore==1.0.9
@@ -51,6 +52,7 @@ soxr==1.0.0
 standard-aifc==3.13.0
 standard-chunk==3.13.0
 standard-sunau==3.13.0
+streamlit>=1.52,<2
 threadpoolctl==3.6.0
 tiktoken==0.12.0
 tokenizers==0.22.2
@@ -59,3 +61,6 @@ transformers==5.0.0rc3
 typer-slim==0.21.1
 typing_extensions==4.15.0
 urllib3==2.6.3
+
+# Local verification tools
+pytest>=9,<10

@@ -8,11 +8,17 @@ models/
 temp_*/
 temp_convert_*.wav
 
+# Build artifacts
+build/
+dist/
+pyinstaller_cache/
+
 # User data (keep folder structure)
 voices/*
 !voices/.gitkeep
 outputs/*
 !outputs/.gitkeep
+web*.log
 
 # System files
 .DS_Store
