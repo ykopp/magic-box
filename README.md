@@ -94,7 +94,7 @@ python3 podcast_generator.py \
 
 ## 🎛 Streamlit 长文播客生成台
 
-如果你想用浏览器直接跑 `podcast_generator.py` 的长文生成主流程，可以启动新的 Streamlit 版本。它支持粘贴/上传 `.txt` 稿件、上传参考音频、使用默认参考音频、选择后端和模型、预览切分段落、断点续生成，并在生成后直接试听/下载 WAV。
+v1.5 的 Streamlit 版本面向正式长文播客生产：提供专业生产控制台、URL 文章提取、声音预设与“人味”控制、节奏优化预览、断点续生成，并在生成后直接试听/下载 WAV。它也支持粘贴/上传 `.txt` 稿件、上传参考音频、使用默认参考音频、选择后端和模型、预览切分段落。
 
 ```bash
 cd /Users/liuchang/Apprun/chenxi/qwen3-tts-apple-silicon
@@ -102,7 +102,9 @@ source .venv/bin/activate
 streamlit run streamlit_app.py
 ```
 
-生成结果仍然保存到 `outputs/`，页面底部会列出最近的 WAV 文件，方便回听和下载。长任务中断后，请保持同一个输出文件名/文件 stem，打开侧边栏的 `Resume from checkpoint` 再继续；页面会在当前会话里保持自动文件名稳定，但正式长文仍建议手动填写一个稳定名称，避免刷新浏览器或重开会话后找不到对应断点。这个界面面向正式长文播客生产；下面的 Gradio Web UI 更适合短句试听、模型路由调试和参数试验。
+生成结果仍然保存到 `outputs/`，页面底部会列出最近的 WAV 文件，方便回听和下载。这个界面面向正式长文播客生产；下面的 Gradio Web UI 更适合短句试听、模型路由调试和参数试验。
+
+**断点续生成说明：** 长文生成会先切成多个 chunk；每个完成的 chunk 会保存为临时音频片段，并记录到对应的 `.ckpt` 文件。若任务中断，请保持同一个输出文件名/文件 stem，并打开 `Resume from checkpoint`，程序会跳过已完成片段继续生成，而不是从头开始。任务成功完成后，checkpoint 和临时片段会自动清理。
 
 ## 🌐 可视化界面 (Web UI)
 

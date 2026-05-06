@@ -7,6 +7,7 @@ models/
 # Temp files
 temp_*/
 temp_convert_*.wav
+qwen_tts_*.wav
 
 # Build artifacts
 build/

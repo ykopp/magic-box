@@ -56,6 +56,7 @@ def generate_podcast(
     output_path: str,
     speed: float = 1.15,
     temperature: float = 1.0,
+    chunk_max_chars: int = 80,
     checkpoint_path: str | None = None,
     normalise: bool = True,
 ) -> str | None:
@@ -84,7 +85,7 @@ def generate_podcast(
         temp_files_to_clean.append(clean_audio)
 
     # -- Text chunking ----------------------------------------------------
-    chunks = split_text(target_text, max_chars=80)
+    chunks = split_text(target_text, max_chars=chunk_max_chars)
     print(f"分成 {len(chunks)} 段生成\n")
 
     # -- Checkpoint: load existing progress --------------------------------
