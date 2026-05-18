@@ -12,31 +12,34 @@ MODELS_DIR = "models"
 
 MODELS = {
     "1": {
-        "name": "Qwen3-TTS-12Hz-0.6B-Base-8bit",
-        "repo": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
-        "desc": "Voice Cloning (Lite - 0.6B)"
-    },
-    "2": {
-        "name": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", 
-        "repo": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
-        "desc": "Custom Voice (Lite - 0.6B)"
-    },
-    "3": {
         "name": "Qwen3-TTS-12Hz-1.7B-Base-8bit",
         "repo": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         "desc": "Voice Cloning (Pro - 1.7B)"
     },
-    "4": {
-        "name": "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
-        "repo": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
-        "desc": "Custom Voice (Pro - 1.7B)"
-    },
-    "5": {
-        "name": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
-        "repo": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
-        "desc": "Voice Design (Pro - 1.7B)"
+    "2": {
+        "name": "Qwen3-TTS-12Hz-0.6B-Base-8bit",
+        "repo": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
+        "desc": "Voice Cloning (Lite - 0.6B)"
     },
 }
+
+REQUIRED_FILES = (
+    "config.json",
+    "model.safetensors",
+    "speech_tokenizer/config.json",
+    "speech_tokenizer/model.safetensors",
+)
+
+
+def validate_model_dir(local_dir):
+    missing = [
+        rel_path
+        for rel_path in REQUIRED_FILES
+        if not os.path.exists(os.path.join(local_dir, rel_path))
+    ]
+    if missing:
+        return False, missing
+    return True, []
 
 def download_model(model_key):
     if model_key not in MODELS:
@@ -59,6 +62,11 @@ def download_model(model_key):
             resume_download=True,
             local_dir_use_symlinks=False
         )
+        valid, missing = validate_model_dir(local_dir)
+        if not valid:
+            print(f"\n✗ 下载后模型仍不完整，缺失: {', '.join(missing)}")
+            print("  缺少 speech_tokenizer/model.safetensors 会导致输出变成噪音。")
+            return False
         print(f"\n✓ 下载完成: {local_dir}")
         return True
     except Exception as e:
@@ -74,9 +82,7 @@ def print_model_list():
         print(f"  {key}. {info['desc']}")
     print("\n推荐下载:")
     print("  - 1.7B Base: 主力 voice cloning")
-    print("  - 1.7B CustomVoice: custom 任务首选")
-    print("  - 1.7B VoiceDesign: design 任务首选")
-    print("  - 0.6B 系列: 速度/内存优先")
+    print("  - 0.6B Base: 速度/内存优先")
     print("="*50)
 
 

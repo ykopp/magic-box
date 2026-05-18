@@ -16,9 +16,34 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
+)
 REMOVE_XPATH = (
     ".//script|.//style|.//noscript|.//svg|.//nav|.//header|.//footer|"
-    ".//aside|.//form|.//button|.//input|.//select|.//textarea"
+    ".//aside|.//form|.//button|.//input|.//select|.//textarea|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), ' ad ')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), ' ads ')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), ' advert')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'promo')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'newsletter')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'subscribe')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'related')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'comment')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'share')]|"
+    ".//*[contains(translate(concat(' ', @class, ' ', @id), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'cookie')]"
 )
 TEXT_BLOCK_XPATH = ".//p|.//li|.//blockquote|.//h2|.//h3"
 CONTAINER_TAGS = {"article", "main", "section", "div", "body"}
@@ -49,12 +74,35 @@ NAV_LIKE_LINES = {
     "上一页",
     "返回",
 }
+BOILERPLATE_PATTERNS = (
+    r"广告",
+    r"赞助",
+    r"相关阅读",
+    r"相关文章",
+    r"推荐阅读",
+    r"延伸阅读",
+    r"点击.*阅读",
+    r"扫码",
+    r"关注.*公众号",
+    r"订阅",
+    r"注册",
+    r"登录",
+    r"版权所有",
+    r"copyright",
+    r"all rights reserved",
+    r"share this",
+    r"follow us",
+    r"sign up",
+    r"newsletter",
+    r"cookie",
+)
 
 
 @dataclass(frozen=True)
 class ArticleExtraction:
     title: str
     text: str
+    podcast_text: str
     source_url: str
 
 
@@ -68,12 +116,7 @@ def extract_article_from_url(url: str, timeout: int = 15) -> ArticleExtraction:
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("仅支持 http:// 或 https:// 开头的文章链接。")
 
-    response = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
-        timeout=timeout,
-    )
-    response.raise_for_status()
+    response = _fetch_article_page(url, timeout)
 
     try:
         document = html.fromstring(response.content)
@@ -84,11 +127,71 @@ def extract_article_from_url(url: str, timeout: int = 15) -> ArticleExtraction:
 
     title = _extract_title(document)
     text = _extract_best_text(document)
+    podcast_text = clean_article_for_podcast(title, text)
 
     if len(text) < MIN_EXTRACTED_CHARS:
         raise ValueError("未能从该链接提取到足够的正文内容，请确认链接是公开可访问的文章页面。")
 
-    return ArticleExtraction(title=title, text=text, source_url=url)
+    return ArticleExtraction(title=title, text=text, podcast_text=podcast_text, source_url=url)
+
+
+def _fetch_article_page(url: str, timeout: int) -> requests.Response:
+    attempts = (
+        _browser_headers(url, USER_AGENT),
+        _browser_headers(url, MOBILE_USER_AGENT),
+    )
+    last_error: requests.HTTPError | None = None
+    for headers in attempts:
+        response = requests.get(url, headers=headers, timeout=timeout)
+        try:
+            response.raise_for_status()
+            return response
+        except requests.HTTPError as exc:
+            if response.status_code != 403:
+                raise
+            last_error = exc
+
+    raise ValueError(
+        "该网站拒绝自动抓取正文（HTTP 403）。可以尝试换一个公开文章链接，"
+        "或直接复制网页正文到“手动输入”。"
+    ) from last_error
+
+
+def _browser_headers(url: str, user_agent: str) -> dict[str, str]:
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": origin,
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def clean_article_for_podcast(title: str, text: str) -> str:
+    """Remove webpage boilerplate and return text shaped for spoken recording."""
+
+    clean_title = _clean_inline(title)
+    raw_lines = re.split(r"\n+", text.replace("\r\n", "\n").replace("\r", "\n"))
+    lines: list[str] = []
+
+    for raw_line in raw_lines:
+        line = _clean_inline(raw_line)
+        if not line:
+            continue
+        if clean_title and _same_text(line, clean_title):
+            continue
+        if _is_navigation_like(line) or _is_boilerplate_line(line):
+            continue
+        lines.append(line)
+
+    cleaned = _join_paragraphs(lines)
+    if clean_title:
+        cleaned = f"{clean_title}\n\n{cleaned}" if cleaned else clean_title
+    return _cap_text(cleaned)
 
 
 def _remove_unwanted_nodes(document: "HtmlElement") -> None:
@@ -223,6 +326,20 @@ def _is_navigation_like(line: str) -> bool:
     if len(normalized) <= 12 and normalized.rstrip(" >»").lower() in NAV_LIKE_LINES:
         return True
     return False
+
+
+def _is_boilerplate_line(line: str) -> bool:
+    normalized = line.strip().lower()
+    if not normalized:
+        return True
+    if len(normalized) <= 18 and re.search(r"^(图|图片|来源|作者|编辑|责任编辑)[:：]", line):
+        return True
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in BOILERPLATE_PATTERNS)
+
+
+def _same_text(left: str, right: str) -> bool:
+    normalize = lambda value: re.sub(r"\W+", "", value, flags=re.UNICODE).lower()
+    return bool(normalize(left)) and normalize(left) == normalize(right)
 
 
 def _cap_text(text: str) -> str:

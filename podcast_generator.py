@@ -4,7 +4,7 @@ podcast_generator.py — CLI voice-clone podcast generator.
 Improvements over original:
 - Uses shared utils.py (no duplicated helpers)
 - Checkpoint / resume: interrupted generations can be continued
-- Loudness normalisation at -16 LUFS (EBU R128 / podcast standard)
+- Loudness normalisation at -16 LUFS with peak limiting
 - Temp files cleaned up even on crash/Ctrl-C
 - Better progress reporting with elapsed time
 """
@@ -23,13 +23,16 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from utils import (
+    check_audio_file_health,
+    check_audio_health,
+    limit_audio_peak,
     load_checkpoint,
     make_output_filename,
     normalise_loudness,
-    SAMPLE_RATE,
     save_checkpoint,
     split_text,
     _safe_remove,
+    convert_wav_to_mp3,
 )
 from tts_backends import (
     QWEN_DEFAULT_MODEL,
@@ -58,6 +61,8 @@ def generate_podcast(
     temperature: float = 1.0,
     chunk_max_chars: int = 80,
     checkpoint_path: str | None = None,
+    checkpoint_metadata: dict | None = None,
+    output_format: str = "mp3",
     normalise: bool = True,
 ) -> str | None:
     """Generate podcast audio for *target_text* by cloning the voice in *ref_audio_path*.
@@ -80,10 +85,6 @@ def generate_podcast(
         print("✗ 参考音频转换失败（检查路径和 ffmpeg）")
         return None
 
-    temp_files_to_clean = []
-    if clean_audio != ref_audio_path:
-        temp_files_to_clean.append(clean_audio)
-
     # -- Text chunking ----------------------------------------------------
     chunks = split_text(target_text, max_chars=chunk_max_chars)
     print(f"分成 {len(chunks)} 段生成\n")
@@ -92,9 +93,10 @@ def generate_podcast(
     completed_indices: list[int] = []
     segment_paths: list[str] = []
 
+    checkpoint_metadata = checkpoint_metadata or {}
     if checkpoint_path:
         ckpt = load_checkpoint(checkpoint_path)
-        if ckpt and ckpt["chunks"] == chunks:
+        if ckpt and ckpt["chunks"] == chunks and ckpt.get("metadata", {}) == checkpoint_metadata:
             completed_indices = ckpt.get("completed", [])
             segment_paths = ckpt.get("segments", [])
             if completed_indices:
@@ -118,7 +120,7 @@ def generate_podcast(
             seg_start = time.time()
 
             try:
-                audio_arr = generate_backend_chunk(
+                audio_result = generate_backend_chunk(
                     backend=backend,
                     model=model,
                     task_mode="clone",
@@ -131,8 +133,10 @@ def generate_podcast(
                     speed=speed,
                     temperature=temperature,
                 )
+                audio_arr = audio_result.audio
+                sample_rate = audio_result.sample_rate
                 elapsed = time.time() - seg_start
-                duration = len(audio_arr) / SAMPLE_RATE
+                duration = len(audio_arr) / sample_rate
                 print(f"    ✓ {elapsed:.0f}s → {duration:.1f}s 音频")
 
                 # Save segment to temp file for checkpoint
@@ -141,18 +145,17 @@ def generate_podcast(
                     f"_seg_{i:04d}.wav",
                 )
                 os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-                sf.write(seg_path, audio_arr, SAMPLE_RATE)
+                sf.write(seg_path, audio_arr, sample_rate)
                 segment_paths[i] = seg_path
                 completed_indices.append(i)
-                temp_files_to_clean.append(seg_path)
 
                 if checkpoint_path:
-                    save_checkpoint(checkpoint_path, chunks, completed_indices, segment_paths)
+                    save_checkpoint(checkpoint_path, chunks, completed_indices, segment_paths, checkpoint_metadata)
 
             except KeyboardInterrupt:
                 print("\n⎹ 中断！保存断点...")
                 if checkpoint_path:
-                    save_checkpoint(checkpoint_path, chunks, completed_indices, segment_paths)
+                    save_checkpoint(checkpoint_path, chunks, completed_indices, segment_paths, checkpoint_metadata)
                 raise
             except Exception as e:
                 print(f"    ✗ 失败: {e}")
@@ -162,10 +165,16 @@ def generate_podcast(
 
     # -- Assemble final audio ---------------------------------------------
     all_audio: list[np.ndarray] = []
+    final_sample_rate: int | None = None
     for i, seg_path in enumerate(segment_paths):
         if i not in completed_indices or not seg_path or not os.path.exists(seg_path):
             continue
-        data, _ = sf.read(seg_path)
+        data, sample_rate = sf.read(seg_path)
+        if final_sample_rate is None:
+            final_sample_rate = int(sample_rate)
+        elif final_sample_rate != int(sample_rate):
+            print(f"\n✗ 片段采样率不一致: {final_sample_rate} vs {sample_rate}")
+            return None
         all_audio.append(data)
 
     if not all_audio:
@@ -173,17 +182,44 @@ def generate_podcast(
         return None
 
     final_audio = np.concatenate(all_audio)
+    final_sample_rate = final_sample_rate or 24000
 
     # -- Loudness normalisation -------------------------------------------
     if normalise:
-        print("\n🔊 响度标准化 (-16 LUFS)…")
-        final_audio = normalise_loudness(final_audio, SAMPLE_RATE)
+        print("\n🔊 响度标准化 (-16 LUFS，峰值限制 0.95 peak)…")
+        final_audio = normalise_loudness(final_audio, final_sample_rate)
+    final_audio = limit_audio_peak(final_audio)
+
+    # -- Audio health check ------------------------------------------------
+    for warning in check_audio_health(final_audio, final_sample_rate, label="final audio before write"):
+        print(f"[audio warning] {warning}")
 
     # -- Save output -------------------------------------------------------
+    output_format = output_format if output_format in {"wav", "mp3", "both"} else "mp3"
+    if output_format == "wav" and not output_path.lower().endswith(".wav"):
+        output_path = output_path.rsplit(".", 1)[0] + ".wav"
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    sf.write(output_path, final_audio, SAMPLE_RATE)
+    wav_path = output_path
+    if output_format in {"mp3", "both"} and not output_path.lower().endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+    sf.write(wav_path, final_audio, final_sample_rate)
 
-    # Clean up segment temp files
+    for warning in check_audio_file_health(wav_path, label="written WAV"):
+        print(f"[audio warning] {warning}")
+
+    result_path = wav_path
+    if output_format in {"mp3", "both"}:
+        mp3_path = wav_path.rsplit(".", 1)[0] + ".mp3"
+        convert_wav_to_mp3(wav_path, mp3_path)
+        print(f"✓ 已保存 MP3: {mp3_path}")
+        for warning in check_audio_file_health(mp3_path, label="written MP3"):
+            print(f"[audio warning] {warning}")
+        if output_format == "mp3":
+            _safe_remove(wav_path)
+            result_path = mp3_path
+
+    # Segment files are checkpoint artifacts during generation; remove them
+    # only after a successful final assembly.
     for seg_path in segment_paths:
         if seg_path:
             _safe_remove(seg_path)
@@ -193,37 +229,43 @@ def generate_podcast(
         _safe_remove(checkpoint_path)
 
     total_elapsed = time.time() - total_start
-    duration = len(final_audio) / SAMPLE_RATE
+    duration = len(final_audio) / final_sample_rate
     print(f"\n{'=' * 60}")
-    print(f"✓ 已保存: {output_path}")
+    print(f"✓ 已保存: {result_path}")
     print(f"✓ 总时长: {duration:.1f}s ({duration / 60:.1f} 分钟)")
     print(f"✓ 总耗时: {total_elapsed:.0f}s ({total_elapsed / 60:.1f} 分钟)")
     print(f"{'=' * 60}")
-    return output_path
+    return result_path
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="播客音频生成工具（声音克隆）")
     parser.add_argument("--text", "-t", help="要生成的文本内容")
     parser.add_argument("--file", "-f", help="文本文件路径")
     parser.add_argument("--output", "-o", default="", help="输出文件路径（默认自动命名）")
     parser.add_argument(
         "--ref-audio", "-r",
-        default="audio_samples/龙湖安置小区 2.m4a",
-        help="参考音频路径（你的声音样本）",
+        default="",
+        help="参考音频路径（请使用你自己录制或上传的声音样本）",
     )
     parser.add_argument(
         "--ref-text",
-        default="大家好，今天是个好日子。很高兴能和大家分享这些内容，希望对你们有所帮助。让我们开始吧。大家好，今天是个好日子。很高兴能和大家分享这些内容，希望对你们有所帮助。让我们开始吧。",
+        default="",
         help="参考音频文本（参考音频里说的内容）",
     )
     parser.add_argument("--speed", "-s", type=float, default=1.15, help="语速 (默认 1.15)")
     parser.add_argument("--temperature", type=float, default=1.0, help="随机性 (默认 1.0)")
     parser.add_argument("--no-normalise", action="store_true", help="跳过响度标准化")
+    parser.add_argument(
+        "--format",
+        choices=["wav", "mp3", "both"],
+        default="mp3",
+        help="输出格式: wav, mp3, both (默认 mp3)",
+    )
     parser.add_argument(
         "--resume", action="store_true",
         help="从上次断点继续（需要保留 checkpoint 文件）",
@@ -243,6 +285,11 @@ def main():
         default="qwen",
         help="后端类型（默认 qwen；voxcpm 仅用于隔离实验）",
     )
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     # -- Text input --------------------------------------------------------
@@ -264,6 +311,12 @@ def main():
         return
 
     # -- Reference audio ---------------------------------------------------
+    if not args.ref_audio:
+        print("✗ 请提供参考音频: --ref-audio path/to/your_voice.wav")
+        return
+    if not args.ref_text.strip():
+        print("✗ 请提供参考音频文本: --ref-text \"参考音频里实际说的内容\"")
+        return
     if not os.path.exists(args.ref_audio):
         print(f"✗ 参考音频不存在: {args.ref_audio}")
         return
@@ -273,7 +326,8 @@ def main():
     if not output_path:
         os.makedirs("outputs", exist_ok=True)
         snippet = target_text[:20]
-        output_path = os.path.join("outputs", make_output_filename(snippet))
+        ext = "mp3" if args.format == "mp3" else "wav"
+        output_path = os.path.join("outputs", make_output_filename(snippet, ext=ext))
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     # -- Checkpoint --------------------------------------------------------
@@ -315,6 +369,7 @@ def main():
         speed=args.speed,
         temperature=args.temperature,
         checkpoint_path=checkpoint_path,
+        output_format=args.format,
         normalise=not args.no_normalise,
     )
 

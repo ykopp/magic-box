@@ -1,12 +1,12 @@
 """
 Shared utility functions for Qwen3-TTS.
-Centralises helpers previously duplicated across main.py, podcast_generator.py,
-and web_interface.py.
+Centralises helpers used by the Streamlit app and CLI generator.
 """
 
 import json
 import os
 import re
+import math
 import subprocess
 import tempfile
 import threading
@@ -17,12 +17,15 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import soundfile as sf
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 24000
 FILENAME_MAX_LEN = 20
+APP_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR = APP_DIR / "runtime"
 
 
 # ---------------------------------------------------------------------------
@@ -66,10 +69,9 @@ def get_smart_path(folder_name: str) -> Optional[str]:
 def convert_audio_if_needed(input_path: str) -> Optional[str]:
     """Convert any audio file to a clean 24 kHz mono WAV.
 
-    Returns the original path if it is already a valid WAV, or a path to a
-    *temporary* WAV file that the caller is responsible for deleting via the
-    returned context.  The function internally writes to a NamedTemporaryFile
-    so the OS will clean it up on crash if the caller forgets.
+    Returns the original path only if it is already a valid 24 kHz mono PCM
+    WAV, or a temporary WAV path that the caller should delete via
+    cleanup_reference_audio.
 
     Raises nothing; returns ``None`` on failure.
     """
@@ -79,11 +81,16 @@ def convert_audio_if_needed(input_path: str) -> Optional[str]:
 
     _, ext = os.path.splitext(input_path)
 
-    # Fast-path: already a valid WAV
+    # Fast-path: already exactly what Qwen expects.
     if ext.lower() == ".wav":
         try:
             with wave.open(input_path, "rb") as f:
-                if f.getnframes() > 0 and f.getsampwidth() > 0:
+                if (
+                    f.getnframes() > 0
+                    and f.getframerate() == SAMPLE_RATE
+                    and f.getnchannels() == 1
+                    and f.getsampwidth() in {2, 3, 4}
+                ):
                     return input_path
         except wave.Error:
             pass  # Fall through to ffmpeg conversion
@@ -92,10 +99,12 @@ def convert_audio_if_needed(input_path: str) -> Optional[str]:
     # Using delete=False so we can pass the path to external tools; caller must
     # remove the file when done.
     try:
+        runtime_dir = RUNTIME_DIR
+        runtime_dir.mkdir(parents=True, exist_ok=True)
         tmp = tempfile.NamedTemporaryFile(
             suffix=".wav",
             prefix="qwen_tts_",
-            dir=os.getcwd(),
+            dir=str(runtime_dir),
             delete=False,
         )
         tmp.close()
@@ -121,7 +130,65 @@ def convert_audio_if_needed(input_path: str) -> Optional[str]:
         return None
     except FileNotFoundError:
         print("[audio] ffmpeg not found. Install with: brew install ffmpeg")
+        _safe_remove(tmp_path if "tmp_path" in dir() else None)
         return None
+
+
+def check_audio_health(
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    *,
+    label: str = "audio",
+    low_rms_threshold: float = 1e-4,
+    low_peak_threshold: float = 1e-4,
+    high_peak_threshold: float = 0.98,
+) -> list[str]:
+    """Return lightweight audio health warnings without raising errors."""
+    warnings: list[str] = []
+    arr = np.asarray(audio)
+
+    if sample_rate <= 0:
+        warnings.append(f"{label}: invalid sample rate ({sample_rate})")
+
+    if arr.size == 0:
+        warnings.append(f"{label}: empty audio")
+        return warnings
+
+    if not np.issubdtype(arr.dtype, np.number):
+        warnings.append(f"{label}: non-numeric audio dtype ({arr.dtype})")
+        return warnings
+
+    finite_mask = np.isfinite(arr)
+    if not np.all(finite_mask):
+        warnings.append(f"{label}: contains NaN or Inf samples")
+
+    finite = arr[finite_mask].astype(np.float64, copy=False)
+    if finite.size == 0:
+        warnings.append(f"{label}: no finite samples")
+        return warnings
+
+    peak = float(np.max(np.abs(finite)))
+    rms = float(math.sqrt(np.mean(np.square(finite))))
+
+    if rms < low_rms_threshold:
+        warnings.append(f"{label}: very low RMS ({rms:.2e})")
+    if peak < low_peak_threshold:
+        warnings.append(f"{label}: very low peak ({peak:.2e})")
+    if peak > 1.0:
+        warnings.append(f"{label}: peak exceeds full scale ({peak:.3f})")
+    elif peak >= high_peak_threshold:
+        warnings.append(f"{label}: peak is near clipping ({peak:.3f})")
+
+    return warnings
+
+
+def check_audio_file_health(path: str, *, label: str = "audio file") -> list[str]:
+    """Read an audio file and return health warnings; failures become warnings."""
+    try:
+        audio, sample_rate = sf.read(path)
+    except Exception as exc:
+        return [f"{label}: could not read audio file ({exc})"]
+    return check_audio_health(audio, int(sample_rate), label=label)
 
 
 def _safe_remove(path: Optional[str]):
@@ -131,6 +198,28 @@ def _safe_remove(path: Optional[str]):
             os.remove(path)
         except OSError:
             pass
+
+
+def convert_wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> str:
+    """Convert a WAV file to MP3 with ffmpeg and return the MP3 path."""
+
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", wav_path,
+        "-codec:a", "libmp3lame",
+        "-b:a", bitrate,
+        mp3_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg not found. Install with: brew install ffmpeg") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"MP3 conversion failed: {exc.stderr.strip()}") from exc
+
+    if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) == 0:
+        raise RuntimeError("MP3 conversion produced an empty file.")
+    return mp3_path
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +269,7 @@ def normalise_loudness(
     audio: np.ndarray,
     sample_rate: int = SAMPLE_RATE,
     target_lufs: float = -16.0,
+    peak_ceiling: float = 0.95,
 ) -> np.ndarray:
     """Apply EBU R128 loudness normalisation to *audio*.
 
@@ -194,13 +284,29 @@ def normalise_loudness(
         if np.isinf(loudness):          # silence or too-short clip
             return audio
         normalised = pyln.normalize.loudness(audio, loudness, target_lufs)
-        # Clamp to [-1, 1] to avoid hard clipping
-        return np.clip(normalised, -1.0, 1.0)
+        return limit_audio_peak(normalised, ceiling=peak_ceiling)
     except ImportError:
         return audio
     except Exception as e:
         print(f"[loudness] Normalisation skipped: {e}")
         return audio
+
+
+def limit_audio_peak(audio: np.ndarray, ceiling: float = 0.95) -> np.ndarray:
+    """Scale audio down when needed so peaks stay below *ceiling* without clipping."""
+    arr = np.asarray(audio)
+    if arr.size == 0:
+        return arr
+
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return arr
+
+    peak = float(np.max(np.abs(finite)))
+    if peak <= 0 or peak <= ceiling:
+        return arr
+
+    return arr * (ceiling / peak)
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +325,16 @@ def make_output_filename(text_snippet: str, ext: str = "wav") -> str:
 # Checkpoint helpers for long-form generation
 # ---------------------------------------------------------------------------
 
-_CHECKPOINT_VERSION = 1
+_CHECKPOINT_VERSION = 2
 
 
-def save_checkpoint(checkpoint_path: str, chunks: list[str], completed_indices: list[int], audio_segments: list[str]):
+def save_checkpoint(
+    checkpoint_path: str,
+    chunks: list[str],
+    completed_indices: list[int],
+    audio_segments: list[str],
+    metadata: Optional[dict] = None,
+):
     """Persist generation progress to disk.
 
     *audio_segments* is a list of absolute paths to per-chunk WAV files.
@@ -233,6 +345,7 @@ def save_checkpoint(checkpoint_path: str, chunks: list[str], completed_indices: 
         "chunks": chunks,
         "completed": completed_indices,
         "segments": audio_segments,
+        "metadata": metadata or {},
     }
     tmp = checkpoint_path + ".tmp"
     try:

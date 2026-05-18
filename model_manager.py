@@ -11,11 +11,38 @@ UPDATE_CACHE_HOURS = 12
 DEFAULT_AUTO_UPDATE = False
 TASK_FALLBACK_CHAIN = {
     "clone": ["clone"],
-    "custom": ["custom"],
-    "design": ["design"],
+    "custom": ["custom", "clone"],
+    "design": ["design", "custom", "clone"],
 }
 
 HUGGINGFACE_MODELS = {
+    "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+        "size_gb": 3.08,
+        "description": "CustomVoice 大模型 (1.7B) - 预置说话人和风格控制，不替代参考音频克隆",
+        "recommended": True,
+        "quality_score": 100,
+        "speed_score": 61,
+        "task": "custom",
+    },
+    "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+        "size_gb": 1.97,
+        "description": "CustomVoice 小模型 (0.6B) - 更快的预置说话人和风格控制备选",
+        "recommended": True,
+        "quality_score": 82,
+        "speed_score": 94,
+        "task": "custom",
+    },
+    "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
+        "size_gb": 3.08,
+        "description": "VoiceDesign 大模型 (1.7B) - 推荐用于按描述设计声音",
+        "recommended": True,
+        "quality_score": 99,
+        "speed_score": 61,
+        "task": "design",
+    },
     "Qwen3-TTS-12Hz-0.6B-Base-8bit": {
         "repo_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
         "size_gb": 1.9,
@@ -25,15 +52,6 @@ HUGGINGFACE_MODELS = {
         "speed_score": 95,
         "task": "clone",
     },
-    "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit": {
-        "repo_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
-        "size_gb": 1.8,
-        "description": "自定义声音模型 (0.6B) - 更灵活",
-        "recommended": True,
-        "quality_score": 80,
-        "speed_score": 90,
-        "task": "custom",
-    },
     "Qwen3-TTS-12Hz-1.7B-Base-8bit": {
         "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         "size_gb": 2.9,
@@ -42,24 +60,6 @@ HUGGINGFACE_MODELS = {
         "quality_score": 98,
         "speed_score": 62,
         "task": "clone",
-    },
-    "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit": {
-        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
-        "size_gb": 2.8,
-        "description": "自定义声音模型 (1.7B) - custom 任务首选，更强情绪控制",
-        "recommended": True,
-        "quality_score": 94,
-        "speed_score": 60,
-        "task": "custom",
-    },
-    "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit": {
-        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
-        "size_gb": 2.9,
-        "description": "声音设计模型 (1.7B) - design 任务首选，适合旁白/角色化声音",
-        "recommended": True,
-        "quality_score": 92,
-        "speed_score": 58,
-        "task": "design",
     },
 }
 
@@ -175,7 +175,12 @@ class ModelManager:
         self.config["remote_meta"][repo_id] = record
 
     def _is_model_valid(self, model_path: Path) -> bool:
-        required_files = ["model.safetensors", "config.json"]
+        required_files = [
+            "model.safetensors",
+            "config.json",
+            "speech_tokenizer/model.safetensors",
+            "speech_tokenizer/config.json",
+        ]
         return all((model_path / f).exists() for f in required_files)
 
     def _read_local_revision_from_cache(self, model_path: Optional[Path]) -> Optional[str]:
@@ -317,17 +322,12 @@ class ModelManager:
         objective: str = "quality",
         downloaded_only: bool = True,
     ) -> Optional[ModelInfo]:
-        task = task.lower().strip()
-        models = self.get_available_models()
-        candidates = [
-            m
-            for m in models
-            if HUGGINGFACE_MODELS.get(m.name, {}).get("task") == task
-            and (m.downloaded if downloaded_only else True)
-        ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda m: self._score_model(m, objective))
+        route = self.get_task_route(
+            task=task,
+            objective=objective,
+            downloaded_only=downloaded_only,
+        )
+        return route[0] if route else None
 
     def get_task_route(
         self,

@@ -10,7 +10,6 @@ from tts_backends import (
     VOXCPM_DEFAULT_MODEL,
     benchmark_generate_case,
 )
-from utils import SAMPLE_RATE
 
 BENCHMARK_CASES = [
     {
@@ -35,7 +34,7 @@ BENCHMARK_CASES = [
 
 
 def run_case(backend: str, model_ref: str, case: dict, ref_audio: str, ref_text: str, output_dir: Path):
-    audio, metrics = benchmark_generate_case(
+    audio_result, metrics = benchmark_generate_case(
         backend=backend,
         model_ref=model_ref,
         task_mode=case["task_mode"],
@@ -43,16 +42,20 @@ def run_case(backend: str, model_ref: str, case: dict, ref_audio: str, ref_text:
         ref_audio_path=ref_audio,
         ref_text=ref_text,
     )
+    audio = audio_result.audio
+    sample_rate = audio_result.sample_rate
     output_path = output_dir / f"{backend}__{case['id']}.wav"
-    sf.write(output_path, audio, SAMPLE_RATE)
+    sf.write(output_path, audio, sample_rate)
+    audio_seconds = len(audio) / sample_rate if sample_rate > 0 else 0
     metrics.update(
         {
             "case_id": case["id"],
             "notes": case["notes"],
             "output_path": str(output_path),
-            "audio_seconds": round(len(audio) / SAMPLE_RATE, 3),
-            "realtime_factor": round(metrics["generate_seconds"] / (len(audio) / SAMPLE_RATE), 3)
-            if len(audio) > 0
+            "sample_rate": sample_rate,
+            "audio_seconds": round(audio_seconds, 3),
+            "realtime_factor": round(metrics["generate_seconds"] / audio_seconds, 3)
+            if audio_seconds > 0
             else None,
             "subjective_similarity": "",
             "subjective_naturalness": "",

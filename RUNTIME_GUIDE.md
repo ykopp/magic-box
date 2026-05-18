@@ -1,149 +1,96 @@
 # Runtime Guide
 
-## Current Decision
+## Stable Entrypoints
 
-- 主线后端: `qwen`
-- 主模型: `models/Qwen3-TTS-12Hz-1.7B-Base-8bit`
-- 速度 fallback: `models/Qwen3-TTS-12Hz-0.6B-Base-8bit`
-- 实验后端: `voxcpm`
-- 当前不作为主线: `0.6B-CustomVoice`、`podcast-tts/Kokoro`
+- Web app: `streamlit run streamlit_app.py`
+- CLI: `.venv/bin/python podcast_generator.py --help`
+- Version: `V1.5.6`
 
-## Recommended Presets
+旧 Gradio UI 和 PyInstaller 打包产物已下线。当前正式工作流只维护 Streamlit Web app 和 CLI。
 
-按当前用户场景，推荐把模型分成三类用途，而不是频繁替换主线：
+## Recent Runtime Fixes
 
-| scene | preferred model | goal | suggested starting params |
-|---|---|---|---|
-| 正文播客 | `Qwen3-TTS-12Hz-1.7B-Base-8bit` | 像本人、稳定、长文可用 | `temperature=1.0`, `speed=1.0`, `--no-normalise` |
-| 开场 / 结尾 / 预告 | `Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit` | 更强起伏和播客感 | `temperature=1.1`, `speed=1.05`, `--no-normalise` |
-| 风格化实验 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit` | 片头包装、角色化旁白 | `temperature=1.1`, `speed=1.0`, `--no-normalise` |
+- Qwen 模型加载前会校验 `config.json`、`model.safetensors`、`speech_tokenizer/config.json`、`speech_tokenizer/model.safetensors`。缺少 speech tokenizer 权重会导致输出噪音，现在会直接报错并提示重新运行 `download_model.py`。
+- `download_model.py` 只保留当前稳定 voice clone 模型下载入口，并在下载后做同一套完整性校验。
+- 默认输出格式改为 MP3；`--format wav` 保留 WAV，`--format both` 同时保留 WAV 和 MP3。MP3 需要 `ffmpeg`。
+- 响度标准化从硬截断改为 peak limiter，目标 -16 LUFS 后按比例降峰到安全 ceiling，降低 clipping 风险。
+- 写入前后会做音频健康检查，提示空音频、低 RMS、低 peak、NaN/Inf、接近 clipping 等风险。
+- 后端输出会保留真实 sample rate，拼接时校验片段采样率一致，避免错误采样率写盘。
+- 依赖升级：`mlx==0.31.2`、`mlx-audio==0.4.3`、`mlx-lm==0.31.3`、`mlx-metal==0.31.2`、`transformers==5.8.1`、`huggingface_hub==1.15.0`。
 
-这些是工作流预设，不是新的 benchmark 结论。真正切换前，仍应以试听结果为准。
+## Models
 
-## Switching Rules
+- 主线模型：`models/Qwen3-TTS-12Hz-1.7B-Base-8bit`
+- 轻量 fallback：`models/Qwen3-TTS-12Hz-0.6B-Base-8bit`
+- 实验后端：`voxcpm`，需要单独安装 `requirements-voxcpm.txt`
 
-- 如果正文已经够像本人，不要为了“更有情绪”直接把整期切到 `CustomVoice`
-- 如果问题只是偏平，先升级参考音频情绪，再微调 `temperature`
-- 如果开场、结尾、预告需要更抓人，再优先试 `1.7B-CustomVoice`
-- 如果目标已经不是“像你本人”，而是明显风格化表达，再试 `VoiceDesign`
-- `VoiceDesign` 默认不回灌到正文主线
+不要把 `CustomVoice` 或 `VoiceDesign` 当作当前稳定主线；多人的声音切换通过 voice profile 的源音频完成。
 
-可执行顺序：
+完整 Qwen 模型目录必须包含：
 
-1. 主体内容先用 `1.7B-Base`
-2. 短片段情绪不足时，先试更有表现力的参考音频
-3. 再把 `temperature` 从 `1.0` 提到 `1.1`
-4. 只有短片段仍然不够抓人时，才切 `1.7B-CustomVoice`
-5. 只有做风格化包装时，才切 `1.7B-VoiceDesign`
-
-## Why
-
-`qwen3-tts-apple-silicon` 是面向 Apple Silicon 本地工作流优化的主链路，已经覆盖：
-
-- 长文自动切段
-- checkpoint / resume
-- 参考音频转换
-- 可选响度标准化
-- Web UI
-- 模型路由
-
-`VoxCPM2` 的定位是能力更高的实验后端。它不替换当前默认链路，只作为独立 backend 进入 A/B 试听和能力验证。
-
-## Backend Matrix
-
-| backend | default model | task support | routing | intended usage |
-|---|---|---|---|---|
-| `qwen` | `Qwen3-TTS-12Hz-1.7B-Base-8bit` | `clone`, `custom`, `design` | yes | 日常本机生产 |
-| `voxcpm` | `openbmb/VoxCPM2` | `clone`, `design` | no | 隔离实验 / 对比试听 |
-
-## CLI
-
-### Qwen mainline
-
-```bash
-python3 podcast_generator.py \
-  --backend qwen \
-  --file 稿件.txt \
-  --ref-audio 我的声音.m4a \
-  --ref-text "参考音频对应文本"
+```text
+config.json
+model.safetensors
+speech_tokenizer/config.json
+speech_tokenizer/model.safetensors
 ```
 
-### Qwen custom intro / outro
+模型缺失或历史下载不完整时运行：
 
 ```bash
-python3 podcast_generator.py \
-  --backend qwen \
-  --model mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit \
-  --file 开场文案.txt \
-  --ref-audio 我的激情开场.m4a \
-  --ref-text "参考音频对应文本" \
-  --temperature 1.1 \
-  --speed 1.05 \
-  --no-normalise
+.venv/bin/python download_model.py 1
 ```
 
-### Qwen voice design experiment
+## Voice Profiles
+
+公开版不内置任何个人声音素材。用户可以临时上传参考音频，也可以新建 profile 写入 `voices/profiles/`。
+`audio_samples/` 和 `voices/profiles/` 里的真实人声素材默认被 Git 忽略。
+
+生成时 checkpoint 会记录声音 profile 元数据；如果切换了源声音，不复用旧断点。
+
+## URL Article Cleanup
+
+Web app 的 URL 抽取会先寻找正文容器，再清理广告、订阅、分享、相关阅读、评论、cookie 提示等网页杂质。页面写入稿件区的是 `podcast_text`，不是原始网页全文。
+
+## Output Formats
+
+默认输出 MP3；需要无损中间文件或后期混音时，可以在 Web app 选择 WAV / WAV + MP3，或在 CLI 使用：
 
 ```bash
-python3 podcast_generator.py \
-  --backend qwen \
-  --model mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit \
-  --text "今晚，我们来聊一首适合深夜独处时反复循环的歌。" \
-  --temperature 1.1 \
-  --speed 1.0 \
-  --no-normalise
+.venv/bin/python podcast_generator.py --file 稿件.txt --format mp3
+.venv/bin/python podcast_generator.py --file 稿件.txt --format wav
+.venv/bin/python podcast_generator.py --file 稿件.txt --format both
 ```
 
-### VoxCPM experiment
+MP3 转换依赖 `ffmpeg`。
 
-VoxCPM 依赖与 Qwen/MLX 主线隔离。只有明确要跑 `backend=voxcpm` 时，才安装：
+## Performance Notes
+
+本机长文生成不是实时任务。Apple Silicon 上的耗时主要受模型大小、内存压力、文本分段和后台应用影响，历史参考如下：
+
+| output duration | wall time | note |
+|---|---:|---|
+| ~30s | ~5 min | short preview |
+| ~1-1.5 min | ~5-23 min | highly variable |
+| ~10 min | ~2.5 hr | use fixed output name and resume |
+
+长文生产建议接电运行、关闭重型后台任务，并固定 `--output` 以便 checkpoint 对齐。
+
+## Generated Files
+
+`outputs/`、`runtime/`、日志、cache、build/dist 都是可再生数据或本机状态。
+清理项目时可以删除它们，但保留：
+
+- `outputs/.gitkeep`
+- `voices/.gitkeep`
+- `voices/profiles/.gitkeep`
+- `audio_samples/.gitkeep`
+- `models/`
+- `.venv/`
+
+## Verification
 
 ```bash
-python3 -m venv .venv-voxcpm
-source .venv-voxcpm/bin/activate
-pip install -r requirements-voxcpm.txt
+.venv/bin/python -m py_compile streamlit_app.py voice_profiles.py voice_controls.py article_extractor.py podcast_generator.py
+.venv/bin/python -m unittest discover -s tests
 ```
-
-```bash
-python3 podcast_generator.py \
-  --backend voxcpm \
-  --model openbmb/VoxCPM2 \
-  --file 稿件.txt \
-  --ref-audio 我的声音.m4a \
-  --ref-text "参考音频对应文本"
-```
-
-## Web UI
-
-启动后可在 `BACKEND` 下拉框中切换：
-
-```bash
-python3 web_interface.py
-```
-
-规则：
-
-- `Qwen Mainline` 保持现有工作流和模型路由
-- `VoxCPM Experimental` 不参与 Qwen 路由，且不支持 `Custom Voice`
-
-## Benchmark
-
-统一 benchmark 入口：
-
-```bash
-python3 benchmark_tts_backends.py \
-  --ref-audio audio_samples/龙湖安置小区\ 2.m4a \
-  --ref-text "大家好，今天是个好日子。很高兴能和大家分享这些内容，希望对你们有所帮助。让我们开始吧。大家好，今天是个好日子。很高兴能和大家分享这些内容，希望对你们有所帮助。让我们开始吧。"
-```
-
-输出目录：
-
-- `outputs/benchmarks/benchmark_results.json`
-- `outputs/benchmarks/benchmark_results.md`
-- `outputs/benchmarks/*.wav`
-
-## Acceptance Rules
-
-- 如果 `VoxCPM` 在本机无法稳定跑完整流程，则只保留为远端候选
-- 如果 `VoxCPM` 音质更强但平台成本更高，则只保留为实验候选
-- 只有当其本机稳定性和工作流贴合度不低于 `qwen` 主线时，才允许进入替换评估
