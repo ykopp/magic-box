@@ -243,7 +243,7 @@ def generate_podcast(
 # ---------------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="播客音频生成工具（声音克隆）")
+    parser = argparse.ArgumentParser(description="Magic Box（声音克隆）")
     parser.add_argument("--text", "-t", help="要生成的文本内容")
     parser.add_argument("--file", "-f", help="文本文件路径")
     parser.add_argument("--output", "-o", default="", help="输出文件路径（默认自动命名）")
@@ -341,7 +341,7 @@ def main():
 
     # -- Model -------------------------------------------------------------
     print(f"\n{'=' * 60}")
-    print("播客音频生成工具")
+    print("Magic Box")
     print(f"{'=' * 60}")
 
     if args.backend == "voxcpm" and args.model == MODEL_PATH:

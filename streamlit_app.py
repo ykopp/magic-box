@@ -22,7 +22,7 @@ PROFILE_AUDIO_TYPES = ["wav", "mp3", "m4a", "aac", "flac", "ogg"]
 
 
 st.set_page_config(
-    page_title="Podcast TTS Production Console",
+    page_title="Magic Box",
     page_icon="🎛️",
     layout="wide",
 )

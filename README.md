@@ -1,8 +1,8 @@
-# Qwen3-TTS 播客克隆生成器
+# Magic Box
 
 当前版本：V1.5.6
 
-Apple Silicon 上的本地播客 TTS 工具。当前稳定入口只有两个：
+Magic Box 是 Apple Silicon 上的本地播客 TTS 工具。当前稳定入口只有两个：
 
 - `streamlit_app.py`：正式 Web 生产台，支持 URL 正文抽取、长文切分、断点继续、多人源声音 Profile。
 - `podcast_generator.py`：命令行长文生成入口，适合批处理和固定脚本。
