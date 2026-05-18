@@ -21,7 +21,7 @@ Magic Box 是 Apple Silicon 上的本地播客 TTS 工具。当前稳定入口�
 ## 快速启动
 
 ```bash
-cd /Users/liuchang/Apprun/chenxi/qwen3-tts-apple-silicon
+cd "/Users/liuchang/Apprun/chenxi/Magic Box"
 source .venv/bin/activate
 streamlit run streamlit_app.py
 ```
