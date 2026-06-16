@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import importlib.util
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -15,9 +16,14 @@ QWEN_DIR = Path(__file__).resolve().parent
 VOXCPM_DIR = WORKSPACE_ROOT / "VoxCPM"
 VOXCPM_SRC_DIR = VOXCPM_DIR / "src"
 
-QWEN_DEFAULT_MODEL = "models/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+QWEN_DEFAULT_MODEL = str(QWEN_DIR / "models" / "Qwen3-TTS-12Hz-1.7B-Base-8bit")
 VOXCPM_DEFAULT_MODEL = "openbmb/VoxCPM2"
+CHATTERBOX_MULTILINGUAL_MODEL = "chatterbox-multilingual-v3"
+CHATTERBOX_TURBO_MODEL = "chatterbox-turbo"
+CHATTERBOX_ENGLISH_MODEL = "chatterbox-english"
 QWEN_DEFAULT_MODEL_PRIORITY = [
+    "Qwen3-TTS-12Hz-1.7B-Base-bf16",
+    "Qwen3-TTS-12Hz-0.6B-Base-bf16",
     "Qwen3-TTS-12Hz-1.7B-Base-8bit",
     "Qwen3-TTS-12Hz-0.6B-Base-8bit",
 ]
@@ -30,6 +36,9 @@ QWEN_TASK_CHOICES = [
 VOXCPM_TASK_CHOICES = [
     ("Voice Clone", "clone"),
     ("Voice Design", "design"),
+]
+CHATTERBOX_TASK_CHOICES = [
+    ("Voice Clone", "clone"),
 ]
 
 QWEN_OBJECTIVE_CHOICES = [
@@ -135,12 +144,18 @@ def _voxcpm_sample_rate(model) -> int:
 
 
 def supported_task_choices(backend: str):
-    return QWEN_TASK_CHOICES if backend == "qwen" else VOXCPM_TASK_CHOICES
+    if backend == "qwen":
+        return QWEN_TASK_CHOICES
+    if backend == "chatterbox":
+        return CHATTERBOX_TASK_CHOICES
+    return VOXCPM_TASK_CHOICES
 
 
 def backend_note(backend: str) -> str:
     if backend == "voxcpm":
         return "VoxCPM 实验后端: Custom Voice / Qwen 路由不可用，speed/temperature 将被忽略。"
+    if backend == "chatterbox":
+        return "Chatterbox 实验后端: 支持参考音频克隆；建议用独立环境安装 chatterbox-tts。"
     return "Qwen 主线后端: 支持模型路由、speed/temperature、长文主工作流。"
 
 
@@ -170,6 +185,23 @@ def get_voxcpm_model_choices() -> List[BackendModelChoice]:
     return choices
 
 
+def get_chatterbox_model_choices() -> List[BackendModelChoice]:
+    return [
+        BackendModelChoice(
+            label="Chatterbox Multilingual V3 | experimental | 23+ languages",
+            value=CHATTERBOX_MULTILINGUAL_MODEL,
+        ),
+        BackendModelChoice(
+            label="Chatterbox Turbo | experimental | English low-latency",
+            value=CHATTERBOX_TURBO_MODEL,
+        ),
+        BackendModelChoice(
+            label="Chatterbox English | experimental",
+            value=CHATTERBOX_ENGLISH_MODEL,
+        ),
+    ]
+
+
 def get_qwen_model_choices():
     from model_manager import model_manager
 
@@ -192,7 +224,11 @@ def get_qwen_model_choices():
 
 
 def get_backend_model_choices(backend: str) -> List[BackendModelChoice]:
-    return get_qwen_model_choices() if backend == "qwen" else get_voxcpm_model_choices()
+    if backend == "qwen":
+        return get_qwen_model_choices()
+    if backend == "chatterbox":
+        return get_chatterbox_model_choices()
+    return get_voxcpm_model_choices()
 
 
 def get_default_model_ref(backend: str) -> str:
@@ -204,7 +240,11 @@ def get_default_model_ref(backend: str) -> str:
                     if pref in choice.value or pref in choice.label:
                         return choice.value
         return choices[0].value
-    return QWEN_DEFAULT_MODEL if backend == "qwen" else VOXCPM_DEFAULT_MODEL
+    if backend == "qwen":
+        return QWEN_DEFAULT_MODEL
+    if backend == "chatterbox":
+        return CHATTERBOX_MULTILINGUAL_MODEL
+    return VOXCPM_DEFAULT_MODEL
 
 
 def _ensure_voxcpm_import():
@@ -234,17 +274,62 @@ def _ensure_voxcpm_import():
     return VoxCPM
 
 
-def _load_qwen_model(model_ref: str):
+def _ensure_chatterbox_import(model_ref: str):
+    missing = [
+        module
+        for module in ("torch", "torchaudio")
+        if importlib.util.find_spec(module) is None
+    ]
+    if importlib.util.find_spec("chatterbox") is None:
+        missing.append("chatterbox-tts")
+    if missing:
+        raise RuntimeError(
+            "Chatterbox experimental backend is not installed in this environment. "
+            f"Missing: {', '.join(missing)}. "
+            "Create an isolated Chatterbox environment and install `pip install chatterbox-tts`, "
+            "or keep using backend=qwen."
+        )
+
+    if model_ref == CHATTERBOX_TURBO_MODEL:
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+        return ChatterboxTurboTTS
+    if model_ref == CHATTERBOX_ENGLISH_MODEL:
+        from chatterbox.tts import ChatterboxTTS
+
+        return ChatterboxTTS
+
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+    return ChatterboxMultilingualTTS
+
+
+def _best_torch_device() -> str:
+    try:
+        import torch
+
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _load_qwen_model(model_ref: str, task_mode: Optional[str] = None):
     from mlx_audio.tts.utils import load_model
     from transformers.utils import logging as transformers_logging
 
     smart_path = get_smart_path(model_ref) if isinstance(model_ref, str) else model_ref
     if not smart_path or not Path(smart_path).exists():
         raise FileNotFoundError(f"模型未找到: {model_ref}")
-    _validate_qwen_model_files(str(smart_path))
+    _validate_qwen_model_files(str(smart_path), require_base_model=task_mode == "clone")
 
     resolved = str(Path(smart_path).resolve())
-    cached = model_cache.get(resolved)
+    cache_token = get_backend_model_cache_token("qwen", resolved)
+    cache_key = f"{resolved}::{cache_token}" if cache_token else resolved
+    cached = model_cache.get(cache_key)
     if cached is not None:
         return cached, resolved
 
@@ -256,11 +341,56 @@ def _load_qwen_model(model_ref: str):
     finally:
         transformers_logging.set_verbosity(original_verbosity)
 
-    model_cache.set(resolved, model)
+    model_cache.set(cache_key, model)
     return model, resolved
 
 
-def _validate_qwen_model_files(model_path: str):
+def get_backend_model_cache_token(backend: str, model_ref: str) -> str:
+    """Return a stable cache token that changes when local model files change."""
+
+    if backend != "qwen":
+        return str(model_ref)
+
+    smart_path = get_smart_path(model_ref) if isinstance(model_ref, str) else model_ref
+    if not smart_path:
+        return str(model_ref)
+
+    path = Path(smart_path)
+    mtimes: list[str] = []
+    for rel_path in QWEN_REQUIRED_MODEL_FILES:
+        candidate = path / rel_path
+        if candidate.exists():
+            mtimes.append(f"{rel_path}:{candidate.stat().st_mtime_ns}")
+    return "|".join(mtimes) if mtimes else str(path)
+
+
+def _read_qwen_model_config(model_path: str) -> dict:
+    config_path = Path(model_path) / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Qwen 模型 config.json 不是有效 JSON: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"Qwen 模型 config.json 必须是对象: {config_path}")
+    return config
+
+
+def _get_qwen_model_type_from_config(model_path: str) -> str:
+    config = _read_qwen_model_config(model_path)
+    model_type = config.get("tts_model_type", "base")
+    return str(model_type).strip().lower() if model_type is not None else ""
+
+
+def _validate_qwen_base_clone_config(model_path: str):
+    model_type = _get_qwen_model_type_from_config(model_path)
+    if model_type != "base":
+        raise ValueError(
+            f"模型类型 {model_type!r} 不支持参考音频克隆。"
+            "请在克隆声音主流程中选择 Qwen3-TTS Base 模型。"
+        )
+
+
+def _validate_qwen_model_files(model_path: str, require_base_model: bool = False):
     path = Path(model_path)
     missing = [file for file in QWEN_REQUIRED_MODEL_FILES if not (path / file).exists()]
     if missing:
@@ -269,6 +399,8 @@ def _validate_qwen_model_files(model_path: str):
             f"Qwen 模型目录不完整: {path}. 缺失: {missing_list}. "
             "请重新运行 download_model.py 下载完整模型；缺少 speech_tokenizer 权重会导致输出变成噪音。"
         )
+    if require_base_model:
+        _validate_qwen_base_clone_config(str(path))
 
 
 def _load_voxcpm_model(model_ref: str):
@@ -287,11 +419,32 @@ def _load_voxcpm_model(model_ref: str):
     return model, cache_key
 
 
-def load_backend_model(backend: str, model_ref: str):
+def _load_chatterbox_model(model_ref: str):
+    model_ref = model_ref or CHATTERBOX_MULTILINGUAL_MODEL
+    model_cls = _ensure_chatterbox_import(model_ref)
+    device = _best_torch_device()
+    cache_key = f"chatterbox::{model_ref}::{device}"
+    cached = model_cache.get(cache_key)
+    if cached is not None:
+        return cached, cache_key
+
+    if model_ref == CHATTERBOX_MULTILINGUAL_MODEL:
+        model = model_cls.from_pretrained(device=device, t3_model="v3")
+    else:
+        model = model_cls.from_pretrained(device=device)
+    model_cache.set(cache_key, model)
+    return model, cache_key
+
+
+def load_backend_model(backend: str, model_ref: str, task_mode: Optional[str] = None):
     if backend == "qwen":
-        return _load_qwen_model(model_ref)
+        return _load_qwen_model(model_ref, task_mode=task_mode)
     if backend == "voxcpm":
         return _load_voxcpm_model(model_ref)
+    if backend == "chatterbox":
+        if task_mode and task_mode != "clone":
+            raise ValueError("Chatterbox backend only supports voice clone task.")
+        return _load_chatterbox_model(model_ref)
     raise ValueError(f"Unsupported backend: {backend}")
 
 
@@ -309,6 +462,7 @@ def generate_qwen_chunk(
 ) -> TTSGenerationResult:
     if task_mode == "clone":
         model_type = getattr(getattr(model, "config", None), "tts_model_type", "base")
+        model_type = str(model_type).strip().lower()
         if model_type != "base":
             raise ValueError(
                 f"模型类型 {model_type!r} 不支持参考音频克隆。"
@@ -393,6 +547,54 @@ def generate_voxcpm_chunk(
     raise ValueError(f"VoxCPM backend does not support task: {task_mode}")
 
 
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _chatterbox_language_id(chunk: str, ref_text: Optional[str]) -> str:
+    combined = f"{ref_text or ''}\n{chunk or ''}"
+    return "zh" if _contains_cjk(combined) else "en"
+
+
+def _audio_to_numpy(audio) -> np.ndarray:
+    if hasattr(audio, "detach"):
+        audio = audio.detach()
+    if hasattr(audio, "cpu"):
+        audio = audio.cpu()
+    if hasattr(audio, "numpy"):
+        audio = audio.numpy()
+    arr = np.asarray(audio, dtype=np.float32)
+    return np.squeeze(arr)
+
+
+def generate_chatterbox_chunk(
+    model,
+    task_mode: str,
+    chunk: str,
+    ref_audio_path: Optional[str],
+    ref_text: Optional[str],
+    speed: float,
+    temperature: float,
+) -> TTSGenerationResult:
+    if task_mode != "clone":
+        raise ValueError("Chatterbox backend only supports voice clone task.")
+    if not ref_audio_path:
+        raise ValueError("Chatterbox voice clone requires ref_audio_path.")
+
+    kwargs = {"audio_prompt_path": ref_audio_path}
+    module_name = model.__class__.__module__
+    if "mtl_tts" in module_name:
+        kwargs["language_id"] = _chatterbox_language_id(chunk, ref_text)
+    if "tts_turbo" not in module_name:
+        kwargs["cfg_weight"] = 0.3 if speed > 1.15 else 0.5
+    if temperature > 1.0 and "tts_turbo" not in module_name:
+        kwargs["exaggeration"] = min(0.8, 0.5 + (temperature - 1.0) * 0.2)
+
+    audio = model.generate(chunk, **kwargs)
+    sample_rate = int(getattr(model, "sr", None) or getattr(model, "sample_rate", None) or SAMPLE_RATE)
+    return TTSGenerationResult(audio=_audio_to_numpy(audio), sample_rate=sample_rate)
+
+
 def generate_backend_chunk(
     backend: str,
     model,
@@ -428,6 +630,16 @@ def generate_backend_chunk(
             ref_text,
             design_instruction,
         )
+    if backend == "chatterbox":
+        return generate_chatterbox_chunk(
+            model,
+            task_mode,
+            chunk,
+            ref_audio_path,
+            ref_text,
+            speed,
+            temperature,
+        )
     raise ValueError(f"Unsupported backend: {backend}")
 
 
@@ -455,14 +667,14 @@ def benchmark_generate_case(
     custom_speaker: str = "Vivian",
     custom_instruction: str = "Normal tone",
     design_instruction: str = "calm podcast narrator with clear articulation",
-    speed: float = 1.15,
-    temperature: float = 1.0,
+    speed: float = 1.05,
+    temperature: float = 0.85,
     progress_callback: Optional[Callable[[str], None]] = None,
 ):
     from utils import split_text
 
     start = time.perf_counter()
-    model, _ = load_backend_model(backend, model_ref)
+    model, _ = load_backend_model(backend, model_ref, task_mode=task_mode)
     load_elapsed = time.perf_counter() - start
 
     chunks = split_text(text, max_chars=80)

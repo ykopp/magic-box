@@ -33,7 +33,8 @@ streamlit run streamlit_app.py
 Streamlit 页面用于正式长文播客生产：
 
 - 粘贴、上传 TXT，或从 URL 抽取文章正文，并清除广告、订阅、分享、相关阅读等网页杂质后整理成播客稿。
-- 选择 Qwen 模型，默认使用本地 `1.7B-Base`。
+- 选择 Qwen 模型，默认优先使用本地 `1.7B-Base-bf16`；未下载时继续使用已有 8bit Base 模型。
+- 可切换到实验后端 Chatterbox / VoxCPM 做对比测试。
 - 选择已保存的“克隆声音 Profile”，或临时上传自己的参考音频。
 - 使用“表达预设”和高级微调控制语速、随机性和单段字符上限。
 - 输出 WAV、MP3，或同时输出 WAV + MP3。
@@ -89,6 +90,13 @@ voices/profiles/<profile_id>/
 .venv/bin/python download_model.py 1
 ```
 
+模型编号：
+
+- `1`: `Qwen3-TTS-12Hz-1.7B-Base-bf16`，高保真主力 voice cloning。
+- `2`: `Qwen3-TTS-12Hz-0.6B-Base-bf16`，轻量稳定备选。
+- `3`: `Qwen3-TTS-12Hz-1.7B-Base-8bit`，磁盘/内存紧张时使用。
+- `4`: `Qwen3-TTS-12Hz-0.6B-Base-8bit`，最快 fallback。
+
 完整的 Qwen voice clone 模型目录必须包含：
 
 ```text
@@ -99,6 +107,29 @@ speech_tokenizer/model.safetensors
 ```
 
 如果缺少 `speech_tokenizer/model.safetensors`，Qwen 可能输出近似噪音的音频；当前版本会在加载阶段拦截这个问题。
+
+### Chatterbox 实验后端
+
+Chatterbox 通过独立依赖文件安装，避免 PyTorch/torchaudio 影响当前 MLX 主环境：
+
+```bash
+python3.11 -m venv .venv-chatterbox
+source .venv-chatterbox/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-chatterbox.txt
+streamlit run streamlit_app.py
+```
+
+CLI 对比：
+
+```bash
+.venv-chatterbox/bin/python podcast_generator.py \
+  --backend chatterbox \
+  --model chatterbox-multilingual-v3 \
+  --file 稿件.txt \
+  --ref-audio 我的声音.wav \
+  --ref-text "参考音频里具体说的文字内容"
+```
 
 ## 性能参考
 
@@ -120,7 +151,7 @@ podcast_generator.py    # CLI 长文生成
 voice_profiles.py       # 多人源声音 profile 管理
 voice_controls.py       # 表达预设和节奏优化
 article_extractor.py    # URL 正文抽取
-tts_backends.py         # Qwen/VoxCPM 后端封装
+tts_backends.py         # Qwen/Chatterbox/VoxCPM 后端封装
 audio_samples/          # 本机可选参考音频，默认忽略，只提交 .gitkeep
 voices/profiles/        # 用户保存的声音 profile，默认忽略
 outputs/                # 生成结果，默认忽略

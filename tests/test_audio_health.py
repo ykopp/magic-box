@@ -8,7 +8,15 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from utils import SAMPLE_RATE, check_audio_health, convert_audio_if_needed, limit_audio_peak
+from utils import (
+    SAMPLE_RATE,
+    check_audio_health,
+    convert_audio_if_needed,
+    limit_audio_peak,
+    measure_audio,
+    smooth_join_audio,
+    validate_generated_audio,
+)
 
 
 class AudioPreparationTest(unittest.TestCase):
@@ -91,6 +99,56 @@ class AudioHealthTest(unittest.TestCase):
         warnings = check_audio_health(limited, SAMPLE_RATE)
 
         self.assertFalse(any("near clipping" in warning for warning in warnings))
+
+    def test_measure_audio_reports_adjacent_jump_metrics(self):
+        audio = np.array([0.0, 0.5, -0.5, 0.25], dtype=np.float32)
+
+        metrics = measure_audio(audio, SAMPLE_RATE)
+
+        self.assertAlmostEqual(metrics.duration_seconds, 4 / SAMPLE_RATE)
+        self.assertEqual(metrics.sample_rate, SAMPLE_RATE)
+        self.assertAlmostEqual(metrics.peak, 0.5)
+        self.assertAlmostEqual(metrics.max_adjacent_jump, 1.0)
+        self.assertGreater(metrics.p999_adjacent_jump, 0.0)
+
+    def test_validate_generated_audio_rejects_bad_chunks(self):
+        warnings = validate_generated_audio(np.array([], dtype=np.float32), SAMPLE_RATE, label="chunk")
+        self.assertTrue(any("empty audio" in warning for warning in warnings))
+
+        warnings = validate_generated_audio(np.array([0.0, np.nan], dtype=np.float32), SAMPLE_RATE)
+        self.assertTrue(any("NaN or Inf" in warning for warning in warnings))
+
+        warnings = validate_generated_audio(np.zeros(SAMPLE_RATE // 100, dtype=np.float32), SAMPLE_RATE)
+        self.assertTrue(any("too short" in warning for warning in warnings))
+        self.assertTrue(any("very low RMS" in warning for warning in warnings))
+        self.assertTrue(any("very low peak" in warning for warning in warnings))
+
+        warnings = validate_generated_audio(np.full(SAMPLE_RATE // 10, 0.99, dtype=np.float32), SAMPLE_RATE)
+        self.assertTrue(any("near clipping" in warning for warning in warnings))
+
+        warnings = validate_generated_audio(np.ones(SAMPLE_RATE // 10, dtype=np.float32) * 1.2, SAMPLE_RATE)
+        self.assertTrue(any("exceeds full scale" in warning for warning in warnings))
+
+        warnings = validate_generated_audio(np.ones(SAMPLE_RATE // 10, dtype=np.float32), 0)
+        self.assertTrue(any("invalid sample rate" in warning for warning in warnings))
+
+    def test_smooth_join_audio_fades_segments_and_inserts_silence_without_mutating_inputs(self):
+        first = np.ones(1000, dtype=np.float32)
+        second = np.ones((1000, 2), dtype=np.float32) * 0.5
+        first_before = first.copy()
+        second_before = second.copy()
+
+        joined = smooth_join_audio([first, second], SAMPLE_RATE, pause_seconds=0.01, fade_ms=10)
+
+        self.assertEqual(joined.ndim, 1)
+        self.assertEqual(joined.dtype, np.float32)
+        self.assertEqual(joined.size, 1000 + int(SAMPLE_RATE * 0.01) + 1000)
+        self.assertAlmostEqual(float(joined[0]), 0.0)
+        self.assertAlmostEqual(float(joined[999]), 0.0)
+        pause = joined[1000:1000 + int(SAMPLE_RATE * 0.01)]
+        self.assertTrue(np.allclose(pause, 0.0))
+        self.assertTrue(np.array_equal(first, first_before))
+        self.assertTrue(np.array_equal(second, second_before))
 
 
 if __name__ == "__main__":

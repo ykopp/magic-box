@@ -11,9 +11,11 @@ Improvements over original:
 
 import argparse
 import os
+import shutil
 import sys
 import time
 import warnings
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -30,9 +32,11 @@ from utils import (
     make_output_filename,
     normalise_loudness,
     save_checkpoint,
+    smooth_join_audio,
     split_text,
     _safe_remove,
     convert_wav_to_mp3,
+    validate_generated_audio,
 )
 from tts_backends import (
     QWEN_DEFAULT_MODEL,
@@ -44,11 +48,70 @@ from tts_backends import (
 )
 
 MODEL_PATH = QWEN_DEFAULT_MODEL
+MAX_CHUNK_ATTEMPTS = 3
+DEFAULT_SPEED = 1.03
+DEFAULT_TEMPERATURE = 0.85
 
 
 # ---------------------------------------------------------------------------
 # Core generation
 # ---------------------------------------------------------------------------
+
+def _generate_validated_chunk(
+    *,
+    backend: str,
+    model,
+    chunk: str,
+    clean_audio: str,
+    ref_text: str,
+    speed: float,
+    temperature: float,
+    chunk_index: int,
+) -> tuple[np.ndarray, int, list[str]]:
+    """Generate one chunk, retrying unsafe waveform output with conservative settings."""
+
+    warnings: list[str] = []
+    last_error = ""
+
+    for attempt in range(1, MAX_CHUNK_ATTEMPTS + 1):
+        attempt_temperature = min(temperature, 0.85) if attempt > 1 else temperature
+        attempt_speed = min(speed, 1.05) if attempt > 1 else speed
+
+        audio_result = generate_backend_chunk(
+            backend=backend,
+            model=model,
+            task_mode="clone",
+            chunk=chunk,
+            ref_audio_path=clean_audio,
+            ref_text=ref_text,
+            custom_speaker="Vivian",
+            custom_instruction="Normal tone",
+            design_instruction="",
+            speed=attempt_speed,
+            temperature=attempt_temperature,
+        )
+
+        audio_arr = np.asarray(audio_result.audio, dtype=np.float32)
+        sample_rate = int(audio_result.sample_rate)
+        warnings = validate_generated_audio(
+            audio_arr,
+            sample_rate,
+            label=f"chunk {chunk_index}",
+        )
+        if not warnings:
+            return audio_arr, sample_rate, warnings
+
+        last_error = "; ".join(warnings)
+        if attempt < MAX_CHUNK_ATTEMPTS:
+            print(f"    ! 音频健康检查失败，重试 {attempt}/{MAX_CHUNK_ATTEMPTS - 1}: {last_error}")
+
+    raise RuntimeError(f"chunk {chunk_index} generated unsafe audio after retries: {last_error}")
+
+
+def _segment_dir_for_output(output_path: str) -> str:
+    output = Path(output_path)
+    return str(output.with_name(f".{output.stem}_segments"))
+
 
 def generate_podcast(
     model,
@@ -57,8 +120,8 @@ def generate_podcast(
     ref_text: str,
     target_text: str,
     output_path: str,
-    speed: float = 1.15,
-    temperature: float = 1.0,
+    speed: float = DEFAULT_SPEED,
+    temperature: float = DEFAULT_TEMPERATURE,
     chunk_max_chars: int = 80,
     checkpoint_path: str | None = None,
     checkpoint_metadata: dict | None = None,
@@ -106,6 +169,8 @@ def generate_podcast(
     while len(segment_paths) < len(chunks):
         segment_paths.append("")
 
+    segment_dir = _segment_dir_for_output(output_path)
+
     # -- Per-chunk generation ---------------------------------------------
     total_start = time.time()
 
@@ -120,31 +185,28 @@ def generate_podcast(
             seg_start = time.time()
 
             try:
-                audio_result = generate_backend_chunk(
+                audio_arr, sample_rate, audio_warnings = _generate_validated_chunk(
                     backend=backend,
                     model=model,
-                    task_mode="clone",
                     chunk=chunk,
-                    ref_audio_path=clean_audio,
+                    clean_audio=clean_audio,
                     ref_text=ref_text,
-                    custom_speaker="Vivian",
-                    custom_instruction="Normal tone",
-                    design_instruction="",
                     speed=speed,
                     temperature=temperature,
+                    chunk_index=i + 1,
                 )
-                audio_arr = audio_result.audio
-                sample_rate = audio_result.sample_rate
                 elapsed = time.time() - seg_start
                 duration = len(audio_arr) / sample_rate
                 print(f"    ✓ {elapsed:.0f}s → {duration:.1f}s 音频")
+                for warning in audio_warnings:
+                    print(f"    [audio warning] {warning}")
 
                 # Save segment to temp file for checkpoint
                 seg_path = os.path.join(
-                    os.path.dirname(output_path) or ".",
+                    segment_dir,
                     f"_seg_{i:04d}.wav",
                 )
-                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+                os.makedirs(segment_dir, exist_ok=True)
                 sf.write(seg_path, audio_arr, sample_rate)
                 segment_paths[i] = seg_path
                 completed_indices.append(i)
@@ -159,6 +221,9 @@ def generate_podcast(
                 raise
             except Exception as e:
                 print(f"    ✗ 失败: {e}")
+                if checkpoint_path:
+                    save_checkpoint(checkpoint_path, chunks, completed_indices, segment_paths, checkpoint_metadata)
+                return None
 
     finally:
         cleanup_reference_audio(ref_audio_path, clean_audio)
@@ -181,7 +246,7 @@ def generate_podcast(
         print("\n✗ 没有成功生成任何片段")
         return None
 
-    final_audio = np.concatenate(all_audio)
+    final_audio = smooth_join_audio(all_audio, final_sample_rate)
     final_sample_rate = final_sample_rate or 24000
 
     # -- Loudness normalisation -------------------------------------------
@@ -223,6 +288,11 @@ def generate_podcast(
     for seg_path in segment_paths:
         if seg_path:
             _safe_remove(seg_path)
+    if os.path.isdir(segment_dir):
+        try:
+            shutil.rmtree(segment_dir)
+        except OSError:
+            pass
 
     # Remove checkpoint on successful completion
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -257,8 +327,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="参考音频文本（参考音频里说的内容）",
     )
-    parser.add_argument("--speed", "-s", type=float, default=1.15, help="语速 (默认 1.15)")
-    parser.add_argument("--temperature", type=float, default=1.0, help="随机性 (默认 1.0)")
+    parser.add_argument("--speed", "-s", type=float, default=DEFAULT_SPEED, help=f"语速 (默认 {DEFAULT_SPEED})")
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help=f"随机性 (默认 {DEFAULT_TEMPERATURE})")
     parser.add_argument("--no-normalise", action="store_true", help="跳过响度标准化")
     parser.add_argument(
         "--format",
@@ -281,9 +351,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=["qwen", "voxcpm"],
+        choices=["qwen", "voxcpm", "chatterbox"],
         default="qwen",
-        help="后端类型（默认 qwen；voxcpm 仅用于隔离实验）",
+        help="后端类型（默认 qwen；voxcpm/chatterbox 仅用于隔离实验）",
     )
     return parser
 
@@ -346,17 +416,21 @@ def main():
 
     if args.backend == "voxcpm" and args.model == MODEL_PATH:
         args.model = VOXCPM_DEFAULT_MODEL
+    elif args.backend == "chatterbox" and args.model == MODEL_PATH:
+        args.model = "chatterbox-multilingual-v3"
 
     print(f"\n后端: {args.backend}")
     print(f"加载模型: {args.model}")
     try:
-        model, _ = load_backend_model(args.backend, args.model)
+        model, _ = load_backend_model(args.backend, args.model, task_mode="clone")
     except Exception as e:
         print(f"✗ 模型加载失败: {e}")
         return
     print("✓ 模型加载成功")
     if args.backend == "voxcpm":
         print("ℹ VoxCPM 为实验后端：不支持 Qwen 的 speed/temperature 控制，按原生推理参数运行。")
+    elif args.backend == "chatterbox":
+        print("ℹ Chatterbox 为实验后端：建议在独立环境安装 chatterbox-tts 后测试。")
 
     # -- Generate ----------------------------------------------------------
     generate_podcast(

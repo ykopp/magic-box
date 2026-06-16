@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 MODELS_DIR_NAME = "podcast_generator_models"
 UPDATE_CACHE_HOURS = 12
 DEFAULT_AUTO_UPDATE = False
+APP_DIR = Path(__file__).resolve().parent
 TASK_FALLBACK_CHAIN = {
     "clone": ["clone"],
     "custom": ["custom", "clone"],
@@ -16,6 +17,24 @@ TASK_FALLBACK_CHAIN = {
 }
 
 HUGGINGFACE_MODELS = {
+    "Qwen3-TTS-12Hz-1.7B-Base-bf16": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+        "size_gb": 4.54,
+        "description": "bf16 基础模型 (1.7B) - 更少量化损失，优先用于高质量 voice cloning",
+        "recommended": True,
+        "quality_score": 100,
+        "speed_score": 55,
+        "task": "clone",
+    },
+    "Qwen3-TTS-12Hz-0.6B-Base-bf16": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
+        "size_gb": 2.51,
+        "description": "bf16 基础模型 (0.6B) - 轻量稳定的 voice cloning 备选",
+        "recommended": True,
+        "quality_score": 82,
+        "speed_score": 90,
+        "task": "clone",
+    },
     "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit": {
         "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
         "size_gb": 3.08,
@@ -98,13 +117,13 @@ def get_models_dir() -> Path:
         models_dir.mkdir(parents=True, exist_ok=True)
         return models_dir
     except PermissionError:
-        project_models = Path.cwd() / "models"
+        project_models = get_project_models_dir()
         project_models.mkdir(parents=True, exist_ok=True)
         return project_models
 
 
 def get_project_models_dir() -> Path:
-    return Path.cwd() / "models"
+    return APP_DIR / "models"
 
 
 def get_config_file() -> Path:
@@ -115,7 +134,7 @@ def get_config_file() -> Path:
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir / "config.json"
     except PermissionError:
-        return Path.cwd() / "podcast_config.json"
+        return APP_DIR / "podcast_config.json"
 
 
 MODELS_DIR = get_models_dir()
@@ -183,6 +202,24 @@ class ModelManager:
         ]
         return all((model_path / f).exists() for f in required_files)
 
+    def _read_tts_model_type(self, model_path: Path) -> Optional[str]:
+        try:
+            config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(config, dict):
+            return None
+        model_type = config.get("tts_model_type", "base")
+        return str(model_type).strip().lower() if model_type is not None else None
+
+    def _is_clone_model_valid(self, model_path: Path) -> bool:
+        return self._is_model_valid(model_path) and self._read_tts_model_type(model_path) == "base"
+
+    def _is_valid_for_registry_task(self, model_name: str, model_path: Path) -> bool:
+        if HUGGINGFACE_MODELS.get(model_name, {}).get("task") == "clone":
+            return self._is_clone_model_valid(model_path)
+        return self._is_model_valid(model_path)
+
     def _read_local_revision_from_cache(self, model_path: Optional[Path]) -> Optional[str]:
         if not model_path:
             return None
@@ -227,11 +264,11 @@ class ModelManager:
 
     def _resolve_model_location(self, model_name: str) -> Tuple[Optional[Path], str]:
         user_path = self.models_dir / model_name
-        if user_path.exists() and self._is_model_valid(user_path):
+        if user_path.exists() and self._is_valid_for_registry_task(model_name, user_path):
             return user_path, "user"
 
         project_path = self.project_models_dir / model_name
-        if project_path.exists() and self._is_model_valid(project_path):
+        if project_path.exists() and self._is_valid_for_registry_task(model_name, project_path):
             return project_path, "project"
 
         return None, "none"

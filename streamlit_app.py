@@ -8,7 +8,12 @@ import streamlit as st
 
 from article_extractor import extract_article_from_url
 from podcast_generator import generate_podcast
-from tts_backends import get_backend_model_choices, get_default_model_ref, load_backend_model
+from tts_backends import (
+    get_backend_model_cache_token,
+    get_backend_model_choices,
+    get_default_model_ref,
+    load_backend_model,
+)
 from utils import _safe_remove, make_output_filename, split_text
 from voice_controls import get_preset, optimize_podcast_rhythm, preset_names
 from voice_profiles import delete_profile, list_profiles, save_profile, slugify_profile_id, text_fingerprint
@@ -408,8 +413,8 @@ def _get_default_choice_index(choices: list, backend: str) -> int:
 
 
 @st.cache_resource(show_spinner=False)
-def _load_model_cached(backend: str, model_ref: str):
-    model, resolved_ref = load_backend_model(backend, model_ref)
+def _load_model_cached(backend: str, model_ref: str, cache_token: str = ""):
+    model, resolved_ref = load_backend_model(backend, model_ref, task_mode="clone")
     return model, resolved_ref
 
 
@@ -514,7 +519,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("制作参数")
-        backend = st.selectbox("TTS 后端", ["qwen", "voxcpm"], index=0)
+        backend = st.selectbox("TTS 后端", ["qwen", "chatterbox", "voxcpm"], index=0)
         model_choices = _filter_model_choices_for_clone(backend, get_backend_model_choices(backend))
 
         if model_choices:
@@ -597,6 +602,8 @@ def main() -> None:
 
         if backend == "voxcpm":
             st.info("VoxCPM 仍是实验后端；语速和表达随机性可能会被后端忽略。")
+        elif backend == "chatterbox":
+            st.info("Chatterbox 仍是实验后端；请在独立环境安装 chatterbox-tts 后再用于长文生成。")
 
     target_text_for_header = st.session_state.get("target_text", "").strip()
     header_chunks = split_text(target_text_for_header, max_chars=chunk_max_chars) if target_text_for_header else []
@@ -869,7 +876,8 @@ def main() -> None:
                 with st.status("加载模型并生成音频...", expanded=True) as status:
                     st.write(f"后端: {backend}")
                     st.write(f"模型: {model_ref}")
-                    model, resolved_ref = _load_model_cached(backend, model_ref)
+                    cache_token = get_backend_model_cache_token(backend, model_ref)
+                    model, resolved_ref = _load_model_cached(backend, model_ref, cache_token)
                     st.write(f"已加载模型: {resolved_ref}")
                     st.write(f"生成 {len(chunks)} 段到 {output_path.relative_to(APP_DIR)}")
                     result = generate_podcast(

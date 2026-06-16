@@ -16,12 +16,16 @@
 - 响度标准化从硬截断改为 peak limiter，目标 -16 LUFS 后按比例降峰到安全 ceiling，降低 clipping 风险。
 - 写入前后会做音频健康检查，提示空音频、低 RMS、低 peak、NaN/Inf、接近 clipping 等风险。
 - 后端输出会保留真实 sample rate，拼接时校验片段采样率一致，避免错误采样率写盘。
+- 新增 Qwen bf16 Base 模型注册，优先用于降低 8bit 量化带来的音质风险。
+- 新增 Chatterbox 实验后端，建议独立环境安装 `requirements-chatterbox.txt`。
 - 依赖升级：`mlx==0.31.2`、`mlx-audio==0.4.3`、`mlx-lm==0.31.3`、`mlx-metal==0.31.2`、`transformers==5.8.1`、`huggingface_hub==1.15.0`。
 
 ## Models
 
-- 主线模型：`models/Qwen3-TTS-12Hz-1.7B-Base-8bit`
-- 轻量 fallback：`models/Qwen3-TTS-12Hz-0.6B-Base-8bit`
+- 推荐主线模型：`models/Qwen3-TTS-12Hz-1.7B-Base-bf16`
+- 轻量稳定 fallback：`models/Qwen3-TTS-12Hz-0.6B-Base-bf16`
+- 低内存 fallback：`models/Qwen3-TTS-12Hz-1.7B-Base-8bit`、`models/Qwen3-TTS-12Hz-0.6B-Base-8bit`
+- 实验后端：`chatterbox`，需要单独安装 `requirements-chatterbox.txt`
 - 实验后端：`voxcpm`，需要单独安装 `requirements-voxcpm.txt`
 
 不要把 `CustomVoice` 或 `VoiceDesign` 当作当前稳定主线；多人的声音切换通过 voice profile 的源音频完成。
@@ -40,6 +44,13 @@ speech_tokenizer/model.safetensors
 ```bash
 .venv/bin/python download_model.py 1
 ```
+
+`download_model.py` 编号：
+
+- `1`: 1.7B Base bf16
+- `2`: 0.6B Base bf16
+- `3`: 1.7B Base 8bit
+- `4`: 0.6B Base 8bit
 
 ## Voice Profiles
 

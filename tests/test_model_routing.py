@@ -1,18 +1,28 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from model_manager import HUGGINGFACE_MODELS, ModelManager
+from model_manager import HUGGINGFACE_MODELS, ModelManager, get_project_models_dir
 from tts_backends import (
     BackendModelChoice,
+    CHATTERBOX_MULTILINGUAL_MODEL,
     generate_qwen_chunk,
+    get_backend_model_choices,
     get_default_model_ref,
     _validate_qwen_model_files,
 )
 
 
 class ModelRoutingTest(unittest.TestCase):
+    def _write_model_files(self, model_dir: Path, config: dict | None = None):
+        (model_dir / "speech_tokenizer").mkdir(parents=True)
+        (model_dir / "config.json").write_text(json.dumps(config or {}), encoding="utf-8")
+        (model_dir / "model.safetensors").write_bytes(b"fake")
+        (model_dir / "speech_tokenizer" / "config.json").write_text("{}", encoding="utf-8")
+        (model_dir / "speech_tokenizer" / "model.safetensors").write_bytes(b"fake")
+
     def _manager_with_models(self, model_names):
         temp_dir = tempfile.TemporaryDirectory()
         root = Path(temp_dir.name)
@@ -23,17 +33,20 @@ class ModelRoutingTest(unittest.TestCase):
         manager.config = {}
 
         for model_name in model_names:
-            model_dir = manager.project_models_dir / model_name
-            (model_dir / "speech_tokenizer").mkdir(parents=True)
-            (model_dir / "config.json").write_text("{}", encoding="utf-8")
-            (model_dir / "model.safetensors").write_bytes(b"fake")
-            (model_dir / "speech_tokenizer" / "config.json").write_text("{}", encoding="utf-8")
-            (model_dir / "speech_tokenizer" / "model.safetensors").write_bytes(b"fake")
+            self._write_model_files(manager.project_models_dir / model_name)
 
         self.addCleanup(temp_dir.cleanup)
         return manager
 
+    def test_project_models_dir_is_anchored_to_magic_box_app_dir(self):
+        app_models_dir = Path(__file__).resolve().parents[1] / "models"
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch("pathlib.Path.cwd", return_value=Path(temp_dir)):
+            self.assertEqual(get_project_models_dir(), app_models_dir)
+
     def test_registry_contains_customvoice_and_voicedesign_models(self):
+        self.assertIn("Qwen3-TTS-12Hz-1.7B-Base-bf16", HUGGINGFACE_MODELS)
+        self.assertIn("Qwen3-TTS-12Hz-0.6B-Base-bf16", HUGGINGFACE_MODELS)
         self.assertIn("Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit", HUGGINGFACE_MODELS)
         self.assertIn("Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", HUGGINGFACE_MODELS)
         self.assertIn("Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", HUGGINGFACE_MODELS)
@@ -102,6 +115,31 @@ class ModelRoutingTest(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "speech_tokenizer/model.safetensors"):
                 _validate_qwen_model_files(str(model_dir))
 
+    def test_qwen_clone_validation_rejects_complete_non_base_config_before_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            self._write_model_files(model_dir, {"tts_model_type": "custom_voice"})
+
+            with self.assertRaisesRegex(ValueError, "不支持参考音频克隆"):
+                _validate_qwen_model_files(str(model_dir), require_base_model=True)
+
+    def test_clone_route_ignores_base_registry_entry_with_non_base_config(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        manager = ModelManager()
+        manager.models_dir = root / "user_models"
+        manager.project_models_dir = root / "project_models"
+        manager.config_file = root / "config.json"
+        manager.config = {}
+
+        self._write_model_files(
+            manager.project_models_dir / "Qwen3-TTS-12Hz-1.7B-Base-8bit",
+            {"tts_model_type": "custom_voice"},
+        )
+
+        self.addCleanup(temp_dir.cleanup)
+        self.assertIsNone(manager.get_model_path("Qwen3-TTS-12Hz-1.7B-Base-8bit"))
+
     def test_design_route_prefers_voicedesign_then_customvoice_then_base(self):
         manager = self._manager_with_models(
             [
@@ -125,6 +163,10 @@ class ModelRoutingTest(unittest.TestCase):
     def test_qwen_default_model_ref_prefers_base_for_reference_audio_cloning(self):
         choices = [
             BackendModelChoice(
+                label="Qwen3-TTS-12Hz-1.7B-Base-bf16 | 项目",
+                value="/models/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+            ),
+            BackendModelChoice(
                 label="Qwen3-TTS-12Hz-1.7B-Base-8bit | 项目",
                 value="/models/Qwen3-TTS-12Hz-1.7B-Base-8bit",
             ),
@@ -137,8 +179,15 @@ class ModelRoutingTest(unittest.TestCase):
         with patch("tts_backends.get_backend_model_choices", return_value=choices):
             self.assertEqual(
                 get_default_model_ref("qwen"),
-                "/models/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+                "/models/Qwen3-TTS-12Hz-1.7B-Base-bf16",
             )
+
+    def test_chatterbox_model_choices_are_available_without_local_download(self):
+        choices = get_backend_model_choices("chatterbox")
+
+        self.assertGreaterEqual(len(choices), 3)
+        self.assertEqual(choices[0].value, CHATTERBOX_MULTILINGUAL_MODEL)
+        self.assertEqual(get_default_model_ref("chatterbox"), CHATTERBOX_MULTILINGUAL_MODEL)
 
     def test_clone_generation_rejects_non_base_model_type(self):
         class FakeModel:

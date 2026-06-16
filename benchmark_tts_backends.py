@@ -6,6 +6,7 @@ from pathlib import Path
 import soundfile as sf
 
 from tts_backends import (
+    CHATTERBOX_MULTILINGUAL_MODEL,
     QWEN_DEFAULT_MODEL,
     VOXCPM_DEFAULT_MODEL,
     benchmark_generate_case,
@@ -67,17 +68,18 @@ def run_case(backend: str, model_ref: str, case: dict, ref_audio: str, ref_text:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="统一对比 Qwen / VoxCPM 的 benchmark 入口")
+    parser = argparse.ArgumentParser(description="统一对比 Qwen / Chatterbox / VoxCPM 的 benchmark 入口")
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=["qwen", "voxcpm"],
-        default=["qwen", "voxcpm"],
+        choices=["qwen", "chatterbox", "voxcpm"],
+        default=["qwen", "chatterbox", "voxcpm"],
         help="需要跑的后端列表",
     )
     parser.add_argument("--ref-audio", required=True, help="统一参考音频")
     parser.add_argument("--ref-text", required=True, help="统一参考音频文本")
     parser.add_argument("--qwen-model", default=QWEN_DEFAULT_MODEL, help="Qwen 模型路径")
+    parser.add_argument("--chatterbox-model", default=CHATTERBOX_MULTILINGUAL_MODEL, help="Chatterbox 模型变体")
     parser.add_argument("--voxcpm-model", default=VOXCPM_DEFAULT_MODEL, help="VoxCPM 模型路径或 HF ID")
     parser.add_argument("--output-dir", default="outputs/benchmarks", help="benchmark 输出目录")
     return parser.parse_args()
@@ -90,6 +92,7 @@ def main():
 
     model_map = {
         "qwen": args.qwen_model,
+        "chatterbox": args.chatterbox_model,
         "voxcpm": args.voxcpm_model,
     }
 
