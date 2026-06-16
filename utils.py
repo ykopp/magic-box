@@ -37,6 +37,9 @@ class AudioMetrics:
     rms: float
     max_adjacent_jump: float
     p999_adjacent_jump: float
+    active_ratio_50ms: float = 1.0
+    longest_low_rms_seconds: float = 0.0
+    short_active_burst_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +218,52 @@ def _to_mono_float(audio: np.ndarray) -> np.ndarray:
     return arr.reshape(-1).astype(np.float32, copy=True)
 
 
+def _continuity_metrics(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    window_seconds: float = 0.05,
+    active_rms_threshold: float = 0.01,
+) -> tuple[float, float, int]:
+    """Return coarse continuity metrics for rejecting broken TTS chunks."""
+    arr = _to_mono_float(audio)
+    if sample_rate <= 0 or arr.size == 0:
+        return 0.0, 0.0, 0
+
+    window = max(1, int(round(sample_rate * window_seconds)))
+    if arr.size < window:
+        rms = float(math.sqrt(np.mean(np.square(arr.astype(np.float64)))))
+        return (1.0 if rms >= active_rms_threshold else 0.0), 0.0, 0
+
+    power = np.square(arr.astype(np.float64))
+    rms = np.sqrt(np.convolve(power, np.ones(window, dtype=np.float64) / window, mode="valid"))
+    active = rms >= active_rms_threshold
+    active_ratio = float(np.mean(active)) if active.size else 0.0
+
+    longest_low = 0
+    current_low = 0
+    short_bursts = 0
+    current_active = 0
+    short_burst_samples = max(1, int(round(0.12 * sample_rate)))
+
+    for value in active:
+        if value:
+            current_active += 1
+            longest_low = max(longest_low, current_low)
+            current_low = 0
+        else:
+            if 0 < current_active < short_burst_samples:
+                short_bursts += 1
+            current_active = 0
+            current_low += 1
+
+    longest_low = max(longest_low, current_low)
+    if 0 < current_active < short_burst_samples:
+        short_bursts += 1
+
+    return active_ratio, float(longest_low / sample_rate), short_bursts
+
+
 def measure_audio(audio: np.ndarray, sample_rate: int) -> AudioMetrics:
     """Return simple mono audio metrics for generated TTS samples."""
     arr = _to_mono_float(audio)
@@ -226,6 +275,9 @@ def measure_audio(audio: np.ndarray, sample_rate: int) -> AudioMetrics:
             rms=0.0,
             max_adjacent_jump=0.0,
             p999_adjacent_jump=0.0,
+            active_ratio_50ms=0.0,
+            longest_low_rms_seconds=0.0,
+            short_active_burst_count=0,
         )
 
     finite = arr[np.isfinite(arr)].astype(np.float64, copy=False)
@@ -237,11 +289,15 @@ def measure_audio(audio: np.ndarray, sample_rate: int) -> AudioMetrics:
             rms=float("nan"),
             max_adjacent_jump=float("nan"),
             p999_adjacent_jump=float("nan"),
+            active_ratio_50ms=0.0,
+            longest_low_rms_seconds=float(arr.size / sample_rate) if sample_rate > 0 else 0.0,
+            short_active_burst_count=0,
         )
 
     jumps = np.abs(np.diff(finite))
     max_jump = float(np.max(jumps)) if jumps.size else 0.0
     p999_jump = float(np.percentile(jumps, 99.9)) if jumps.size else 0.0
+    active_ratio, longest_low, short_bursts = _continuity_metrics(arr, sample_rate)
 
     return AudioMetrics(
         duration_seconds=float(arr.size / sample_rate) if sample_rate > 0 else 0.0,
@@ -250,6 +306,9 @@ def measure_audio(audio: np.ndarray, sample_rate: int) -> AudioMetrics:
         rms=float(math.sqrt(np.mean(np.square(finite)))),
         max_adjacent_jump=max_jump,
         p999_adjacent_jump=p999_jump,
+        active_ratio_50ms=active_ratio,
+        longest_low_rms_seconds=longest_low,
+        short_active_burst_count=short_bursts,
     )
 
 
@@ -262,6 +321,10 @@ def validate_generated_audio(
     low_rms_threshold: float = 1e-4,
     low_peak_threshold: float = 1e-4,
     near_clip_threshold: float = 0.98,
+    min_active_ratio_50ms: float = 0.35,
+    max_low_rms_gap_seconds: float = 0.80,
+    max_adjacent_jump_threshold: float = 0.65,
+    max_short_active_bursts: int = 8,
 ) -> list[str]:
     """Return warnings/errors that should reject bad generated audio chunks."""
     warnings: list[str] = []
@@ -296,6 +359,25 @@ def validate_generated_audio(
             warnings.append(f"{label}: peak exceeds full scale ({metrics.peak:.3f})")
         elif metrics.peak >= near_clip_threshold:
             warnings.append(f"{label}: peak is near clipping ({metrics.peak:.3f})")
+
+    if metrics.duration_seconds >= 1.0:
+        if metrics.active_ratio_50ms < min_active_ratio_50ms:
+            warnings.append(
+                f"{label}: too much low-energy audio "
+                f"(active ratio {metrics.active_ratio_50ms:.2f})"
+            )
+        if metrics.longest_low_rms_seconds > max_low_rms_gap_seconds:
+            warnings.append(
+                f"{label}: long internal low-energy gap "
+                f"({metrics.longest_low_rms_seconds:.2f}s)"
+            )
+        if metrics.short_active_burst_count > max_short_active_bursts:
+            warnings.append(
+                f"{label}: too many short active bursts "
+                f"({metrics.short_active_burst_count})"
+            )
+    if np.isfinite(metrics.max_adjacent_jump) and metrics.max_adjacent_jump > max_adjacent_jump_threshold:
+        warnings.append(f"{label}: abrupt waveform jump ({metrics.max_adjacent_jump:.3f})")
 
     return warnings
 

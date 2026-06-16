@@ -132,6 +132,23 @@ class AudioHealthTest(unittest.TestCase):
         warnings = validate_generated_audio(np.ones(SAMPLE_RATE // 10, dtype=np.float32), 0)
         self.assertTrue(any("invalid sample rate" in warning for warning in warnings))
 
+    def test_validate_generated_audio_rejects_bursty_discontinuous_audio(self):
+        audio = np.zeros(SAMPLE_RATE * 5, dtype=np.float32)
+        burst = np.sin(np.linspace(0, np.pi * 80, int(SAMPLE_RATE * 0.18))).astype(np.float32) * 0.7
+        for start_second in (0.7, 2.1, 3.5):
+            start = int(start_second * SAMPLE_RATE)
+            audio[start:start + burst.size] = burst
+        audio[int(2.5 * SAMPLE_RATE)] = -0.8
+        audio[int(2.5 * SAMPLE_RATE) + 1] = 0.8
+
+        metrics = measure_audio(audio, SAMPLE_RATE)
+        warnings = validate_generated_audio(audio, SAMPLE_RATE, label="chunk")
+
+        self.assertLess(metrics.active_ratio_50ms, 0.35)
+        self.assertTrue(any("too much low-energy audio" in warning for warning in warnings))
+        self.assertTrue(any("long internal low-energy gap" in warning for warning in warnings))
+        self.assertTrue(any("abrupt waveform jump" in warning for warning in warnings))
+
     def test_smooth_join_audio_fades_segments_and_inserts_silence_without_mutating_inputs(self):
         first = np.ones(1000, dtype=np.float32)
         second = np.ones((1000, 2), dtype=np.float32) * 0.5

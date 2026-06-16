@@ -258,6 +258,14 @@ def generate_podcast(
     # -- Audio health check ------------------------------------------------
     for warning in check_audio_health(final_audio, final_sample_rate, label="final audio before write"):
         print(f"[audio warning] {warning}")
+    final_errors = validate_generated_audio(final_audio, final_sample_rate, label="final audio before write")
+    if final_errors:
+        print("\n✗ 最终音频健康检查失败，已停止写出坏音频:")
+        for warning in final_errors:
+            print(f"  - {warning}")
+        if checkpoint_path:
+            save_checkpoint(checkpoint_path, chunks, completed_indices, segment_paths, checkpoint_metadata)
+        return None
 
     # -- Save output -------------------------------------------------------
     output_format = output_format if output_format in {"wav", "mp3", "both"} else "mp3"
