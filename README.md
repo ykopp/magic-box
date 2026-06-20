@@ -1,73 +1,158 @@
 # Magic Box
 
-当前版本：V1.5.6
+> 最后更新：2026-06-21
 
-Magic Box 是 Apple Silicon 上的本地播客 TTS 工具。当前稳定入口只有两个：
+当前版本：V2.2.0
 
-- `streamlit_app.py`：正式 Web 生产台，支持 URL 正文抽取、长文切分、断点继续、多人源声音 Profile。
-- `podcast_generator.py`：命令行长文生成入口，适合批处理和固定脚本。
+Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS** 和 **VoxCPM2** 两个 MLX 原生后端。
 
-旧 Gradio UI、打包 app、个人声音素材和历史生成音频已经清理；公开仓库只保留通用程序，用户需要自行录制或上传自己的参考音频。
+- `streamlit_app.py`：Web 生产台，支持 URL 正文抽取、长文切分、断点续跑、多人源声音 Profile、模型管理、生成实时进度。
+- `podcast_generator.py`：CLI 长文生成，适合批处理和固定脚本。
 
-## 最近修复
+> 本目录是经过 2026-06-17 合并整理后的唯一工作目录。原 `/Users/liuchang/Workspaces/Apprun/chenxi/Magic Box/`（旧 V2.0.0）已被删除，所有代码 / 配置已合并到本目录；原 `/Users/liuchang/Apprun/chenxi/Magic Box/`（旧 V1.5.7）已被本目录的 V2.0.0 内容覆盖。完整备份在 `~/MagicBox-Backup-20260617/`。
 
-- 补齐并强校验 Qwen 模型目录里的 `speech_tokenizer/config.json` 和 `speech_tokenizer/model.safetensors`；缺少 speech tokenizer 权重时会直接报错，不再继续生成噪音音频。
-- `download_model.py` 下载完成后会做模型完整性校验；Web/CLI 加载模型前也会校验主权重、配置和 speech tokenizer 权重是否齐全。
-- 默认输出改为 MP3，CLI 与 Web 都支持 `mp3`、`wav`、`both`；MP3 转换依赖本机 `ffmpeg`。
-- 修复响度标准化后的硬 clipping：现在使用 peak limiter 按比例降峰，并在写入前后输出音频健康警告。
-- 生成链路保留后端返回的真实 sample rate，避免不同后端或实验模型被强行写成固定采样率。
-- 依赖升级到稳定 PyPI 版本：`mlx==0.31.2`、`mlx-audio==0.4.3`、`mlx-lm==0.31.3`、`mlx-metal==0.31.2`、`transformers==5.8.1`、`huggingface_hub==1.15.0`。
+## 最近更新
+
+### v2.2.0（2026-06-21 参考语速校准 + 项目清理）
+
+- **参考语速校准**（`podcast_generator.py`）：Qwen clone 下 UI / CLI 的 `speed=1.00` 现在表示“尽量贴近参考音频语速”，生成前会根据 `reference_clean.wav` 的字/秒折算成实际模型 speed，并写入 `quality_report.json` 的 `generation.model_speed` 和 `generation.rate_calibration`。
+- **默认预设回归自然速度**（`voice_controls.py`）：默认“自然播客”保持 `speed=1.00`、`temperature=0.85`、`chunk_max_chars=260`，避免默认参数把参考音频较慢的 Profile 播快。
+- **运行产物清理**：`outputs/`、`runtime/`、`audio_samples/` 默认只保留 `.gitkeep`；缓存、`.DS_Store`、旧调试音频和临时上传文件均可再生，不应提交。
+- **当前个人 Profile 保留在本机**：`voices/profiles/刘畅/` 是当前使用的本机声音 Profile，仍被 Git 忽略，不会推送到 GitHub。
+
+测试增至 **113**，覆盖参考音频清洗、质量报告、质量门禁、Profile 保存清洗产物、UI 报告解析、默认参数范围、参考语速校准和模型路由。
+
+### v2.1.0（2026-06-18 参考音频清洗 + 质量门禁）
+
+针对“bf16 仍会生成断续 burst / 低能量停顿 / sample jump 爆音”的问题，生成链路从“生成后只提示 warning”升级为“生成前清洗参考音频、生成中保留证据、生成后写质量报告并阻断坏音频”：
+
+- **参考音频自动清洗**（`utils.py:prepare_reference_audio_clip`）：源声音会先转成 24 kHz mono WAV，再自动裁出 3-8 秒连续、低停顿、RMS/peak 正常的人声片段，写入 `reference_clean.wav` 和 `reference_quality.json`。找不到合格片段时会失败并写明原因。
+- **Profile 保存清洗产物**（`voice_profiles.py`）：保存声音 Profile 时保留 `reference_original.<ext>`，实际克隆使用 `reference_clean.wav`，并保存 `reference_quality.json` 便于复查。
+- **生成前参考音频门禁**（`tts_backends.py:prepare_reference_audio`）：Qwen / VoxCPM clone 只接收清洗后的 WAV；参考音频太短、过静、停顿太长或 clipping 时会提前失败。
+- **每段原始 chunk 保留证据**（`podcast_generator.py`）：默认把 `_seg_*.wav` 写到 `outputs/.<output_stem>_segments/`，方便定位是哪一段模型输出坏。
+- **质量报告**（`quality_report.json`）：记录每段和最终音频的 `duration`、`rms`、`peak`、`low_energy_ratio`、`longest_low_energy_run`、`jump_count_gt_0_3`、`jump_count_gt_0_5`、`max_jump`。
+- **质量门禁**（`audio_quality_issues`）：遇到明显爆音跳变、长低能量段、全静默、NaN/Inf、near clipping 等问题时标记 failed，不再把坏音频当成成功结果。
+- **Web UI 展示质量报告**（`streamlit_app.py`）：生成后显示质量摘要、失败段编号、报告路径和 segments 文件夹；失败但已有证据时也会展示质量报告。
+- **默认参数收敛**（`voice_controls.py`）：默认“自然播客”改为更稳的 `speed=1.00`、`temperature=0.85`、`chunk_max_chars=260`；Qwen clone 会把 `1.00` 按参考音频语速折算成模型 speed，高级参数旁增加高风险提示。
+
+测试增至 **112+**，覆盖参考音频清洗、质量报告、质量门禁、Profile 保存清洗产物、UI 报告解析和默认参数范围。
+
+### v2.0.1（2026-06-17 音频质量二审）
+
+针对音频生成链路做了二次深度审计与修复，覆盖清晰度、音量平衡、无杂音、格式兼容性、播放流畅度、内容完整性六个维度：
+
+- **VoxCPM2 采样率探测改为显式失败**（`tts_backends.py:_voxcpm_sample_rate`）：原代码在无法识别模型采样率时静默 fallback 到 24 kHz,会导致 48 kHz 的 VoxCPM2 输出被错标为 24 kHz,播放速度减半。现改为 `raise ValueError`,并给出"补充探测路径 / 显式指定"的可执行修复指引。
+- **VoxCPM2 空迭代器防护**（`generate_voxcpm_chunk`）：`next(result)` 在空生成器上抛 `StopIteration`,现与 Qwen 路径一致包 `try/except` 并抛出包含 chunk 文本的 `RuntimeError`。
+- **VoxCPM2 模型文件校验**（`_validate_voxcpm_model_files`）：镜像 Qwen 的 `_validate_qwen_model_files`,在 `load_model` 之前先确认本地 snapshot 含 `config.json`,否则给出可读错误（避免 mlx_audio 内部报晦涩异常）。
+- **生产链路采样率一致性**（`podcast_generator.py:generate_podcast`）：在主循环中跟踪 `expected_sample_rate`,跨段采样率不一致时立即 `raise ValueError`,与 `benchmark_generate_case` 行为对齐。原来的"最后再读盘检查"会让坏段先污染 checkpoint。
+- **健康检查阈值与限幅对齐**（`utils.py:check_audio_health`）：`high_peak_threshold` 由 0.98 下调到 0.95,与 `limit_audio_peak(ceiling=0.95)` 对齐。原阈值 0.98 让限幅器失效的样本（peak 介于 0.95–0.98）能蒙混过关,只在真正爆音时才告警,已经太晚。
+- **短段 crossfade 智能收缩**（`utils.py:crossfade_concat`）：当段长度 < 请求的 fade 窗口时,改为 `fade = min(requested, len(out), len(s))`,仅在两边都 < `min_fade_samples`(默认 8) 时才退化到硬拼接。原来的"任一不足即硬切"会在 trim_silence 后段过短时产生 click,与之前已修复的咔嗒声属于同一类问题。
+- **单 chunk 音频健康检查**（`podcast_generator.py`）：每段生成后立即调 `check_audio_health`,NaN/Inf / 全静默 / peak clipping / 低 RMS 会在出问题时立刻打 `[audio warning]`,而不是等到最终 mix 才发现无法定位。
+- **`trim_silence` 全静默输入保护**（`utils.py:trim_silence`）：当 chunk 长度 ≤ head+tail 强制裁剪量时,原来返回空数组(导致静默失败),现改为打 warning 并保留原音频,避免整段被吞掉。
+- **VoxCPM2 ref_text 隐式约定清理**（`generate_voxcpm_chunk`）：`ref_text.strip() != "."` 这种"句点表示无 ref"隐式约定容易遗漏,简化为 `if ref_text and ref_text.strip():`。
+- **ffmpeg 缺失行为一致化**（`utils.py:convert_audio_if_needed`）：原来静默返回 `None` 让上游笼统报"参考音频转换失败",现与 `convert_wav_to_mp3` 一样 `raise RuntimeError("ffmpeg not found...")`,让用户立刻知道要 `brew install ffmpeg`。
+- **`as_tts_result` 采样率校验**（`tts_backends.py:as_tts_result`）：对 sample_rate 做 `int(...) > 0` 校验,无效时 `raise ValueError` 而不是写入错误元数据。
+
+测试从 55 增至 **61**（新增 1 个 VoxCPM2 错误行为测试 + 跨模块回归覆盖）。
+
+### v2.0.0（2026-06-17 合并）
+
+- **VoxCPM2 后端全面迁移到 MLX 原生**：不再需要 PyTorch / torchaudio / einops。
+  默认模型 `mlx-community/VoxCPM2-8bit`，另可选 bf16 / 4-bit 量化版。
+  VoxCPM2 支持 48 kHz 高保真输出、30 语言 + 9 方言、Voice Design + Clone + Ultimate Clone。
+- **Qwen3-TTS bf16 模型**：补充了 5 个 bf16 变体，质量分数 82-100。
+- **模型注册表扩展到 13 个模型**：5 个 Qwen 8-bit + 5 个 Qwen bf16 + 3 个 VoxCPM2 MLX。
+- **`_safe_remove` 改为 `safe_remove`**，返回 `bool` 表示是否实际删除了文件。
+- **`save_checkpoint` 返回 `bool`**，让 CLI 和 Web 端能感知磁盘满或权限不足等失败。
+- **`model_manager.get_models_dir` 回退时打印 warning 日志**。
+- **`VoiceProfile.fingerprint` 使用 ref_audio 内容 SHA-256**，不再嵌入绝对路径，跨机器可复用断点。
+- **上传文件大小限制 50 MB**，runtime 目录总量限制 500 MB，超出时自动清理最旧文件。
+- **CSS 抽出到 `app_styles.css`**，Streamlit 启动时按需注入。
+- **`logging` 替代部分 `print`**，CLI 输出到 stderr，Streamlit 以 WARNING 级别输出。
+- **`pyproject.toml` + `Makefile`** 标准化项目管理。
+- **Web 端生成链路加进度回调**（`progress_callback`）：每段完成会刷新到 `st.progress` 进度条，方便观察长文生成状态。
+- **V1.5.7 → V2.0.0 合并**：移除 V1.5.7 严格的 `validate_generated_audio`（chunk 1 冷启动被误杀），V2.0.0 用更轻的 `check_audio_health` 只警告不阻断。
+- **Chatterbox 后端下线**：原 V1.5.7 的 Chatterbox 实验后端和 `requirements-chatterbox.txt` 已删除（V2.0.0 改用 VoxCPM2）。
+
+### 历史修复
+
+- 补齐并强校验 Qwen 模型目录里的 `speech_tokenizer/config.json` 和 `speech_tokenizer/model.safetensors`。
+- 默认输出改为 MP3，CLI 与 Web 都支持 `mp3`、`wav`、`both`。
+- 响度标准化后使用 peak limiter 按比例降峰。
+- 生成链路保留后端返回的真实 sample rate。
 
 ## 快速启动
 
 ```bash
-cd "/Users/liuchang/Apprun/chenxi/Magic Box"
-source .venv/bin/activate
-streamlit run streamlit_app.py
+cd /Users/liuchang/Apprun/chenxi/Magic\ Box
+./.venv/bin/python -m streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8507
 ```
 
-浏览器打开 `http://127.0.0.1:8501/`。
+浏览器打开 `http://127.0.0.1:8507/`。
+
+不要直接运行：
+
+```bash
+python3 streamlit_app.py
+```
+
+也不要使用系统 Python 的 `python3 -m streamlit`。Qwen / VoxCPM 后端必须使用项目 `.venv` 中的 `mlx-audio==0.4.3`；旧版 `mlx-audio` 会让 Qwen speech tokenizer encoder 不可用，生成音频出现固定空洞和断续。
+
+或使用 Makefile：
+
+```bash
+cd /Users/liuchang/Apprun/chenxi/Magic\ Box
+make run-streamlit
+```
 
 ## Web 生产台
 
 Streamlit 页面用于正式长文播客生产：
 
-- 粘贴、上传 TXT，或从 URL 抽取文章正文，并清除广告、订阅、分享、相关阅读等网页杂质后整理成播客稿。
-- 选择 Qwen 模型，默认优先使用本地 `1.7B-Base-bf16`；未下载时继续使用已有 8bit Base 模型。
-- 可切换到实验后端 Chatterbox / VoxCPM 做对比测试。
-- 选择已保存的“克隆声音 Profile”，或临时上传自己的参考音频。
-- 使用“表达预设”和高级微调控制语速、随机性和单段字符上限。
+- 粘贴、上传 TXT（UTF-8 / GB18030，上限 50 MB），或从 URL 抽取文章正文，清除广告、订阅、分享等网页杂质后整理成播客稿。
+- 在 Qwen 和 VoxCPM2 两个后端间切换。Qwen 支持 speed / temperature / 模型路由；VoxCPM2 输出 48 kHz 高保真音频。
+- 选择已保存的"克隆声音 Profile"，或临时上传参考音频。
+- 使用"表达预设"（稳定清晰 / 自然播客 / 热情开场 / 沉稳叙事 / 快速草稿）和高级微调控制语速、随机性和单段字符上限；Qwen clone 下语速 `1.00` 表示尽量贴近参考音频语速。
 - 输出 WAV、MP3，或同时输出 WAV + MP3。
-- 开启“从断点继续”后，中断任务可按同一输出文件名续跑。
+- 开启"从断点继续"后，中断任务可按同一输出文件名续跑。断点文件 fingerprint 已改为内容哈希，跨机器可复用。
+- 生成过程中页面会显示进度条和每段状态，方便观察长文生成。
+- 生成后会读取 `quality_report.json`，显示质量摘要、失败段编号和 `_seg_*.wav` 证据目录。
 - 生成后在页面底部输出库试听和下载所选格式。
+
+### 后端选择
+
+| 后端 | 模型 | 特点 |
+|---|---|---|
+| **qwen** | Qwen3-TTS 0.6B/1.7B (8-bit / bf16) | speed / temperature 控制，10 语言，3 秒 Clone，Voice Design |
+| **voxcpm** | VoxCPM2 (8-bit / bf16 / 4-bit) | 48 kHz，30 语言 + 9 方言，Voice Design + Clone |
 
 ### 声音 Profile
 
-公开版不会内置任何个人声音。用户可以在页面里临时上传参考音频，也可以在“管理声音 Profile”里保存自己的样本。
+公开版不会内置任何个人声音。用户可以临时上传参考音频，或在"管理声音 Profile"里保存自己的样本。
 
-新保存的 profile 会写入：
+新保存的 profile 写入：
 
 ```text
 voices/profiles/<profile_id>/
   metadata.json
-  reference.<ext>
+  reference_original.<ext>
+  reference_clean.wav
+  reference_quality.json
   transcript.txt
 ```
 
 这些个人声音数据默认不提交 Git。
 
-`audio_samples/` 仅作为本机可选素材目录保留占位，目录内音频默认被 Git 忽略。不要把真实人声素材提交到公开仓库。
-
 ## CLI 生成
 
 ```bash
-.venv/bin/python podcast_generator.py \
+python3 podcast_generator.py \
   --file 稿件.txt \
   --ref-audio 我的声音.m4a \
   --ref-text "参考音频里具体说的文字内容" \
   --output outputs/my_episode.mp3 \
   --format both \
-  --no-normalise
+  --backend qwen
 ```
 
 关键参数：
@@ -75,60 +160,72 @@ voices/profiles/<profile_id>/
 - `--file` / `--text`：输入稿件。
 - `--ref-audio`：用于克隆的源声音。
 - `--ref-text`：源声音里实际说的文字，必须尽量逐字一致。
-- `--output`：输出路径；默认自动生成 `.mp3` 文件名。长文建议固定文件名，方便断点继续。
+- `--output`：输出路径；默认自动生成 `.mp3` 文件名。
 - `--format`：输出格式，支持 `wav`、`mp3`、`both`，默认 `mp3`。
 - `--resume`：从已有 `.ckpt` 断点继续。
-- `--speed` / `--temperature`：控制语速和表达随机性。
+- `--backend`：`qwen`（默认）或 `voxcpm`。
+- `--speed` / `--temperature`：控制语速和表达随机性（仅 Qwen 后端）；Qwen clone 会把 `--speed 1.0` 按参考音频语速自动校准。
+- `--no-normalise`：跳过响度标准化。
 
-断点文件会记录稿件切分和声音 profile 元数据；如果换了源声音，不会复用旧断点，避免混入不同人的声音片段。
+生成默认会在输出目录写入 `quality_report.json`，并保留每段原始 chunk 到 `outputs/.<output_stem>_segments/`。如果质量门禁失败，输出文件不会被当作成功结果返回，但报告和片段证据会保留。
 
 ## 模型与依赖
 
-首次运行或模型异常时，先重新下载主模型：
+### 模型管理
+
+使用 Model Manager 查看和下载模型：
 
 ```bash
-.venv/bin/python download_model.py 1
+# CLI 路由工具
+python3 model_route_cli.py --task clone --objective quality
+python3 model_route_cli.py --auto-download --task clone
+
+# Makefile
+make route ARGS="--task clone"
 ```
 
-模型编号：
+### 可用模型（13 个）
 
-- `1`: `Qwen3-TTS-12Hz-1.7B-Base-bf16`，高保真主力 voice cloning。
-- `2`: `Qwen3-TTS-12Hz-0.6B-Base-bf16`，轻量稳定备选。
-- `3`: `Qwen3-TTS-12Hz-1.7B-Base-8bit`，磁盘/内存紧张时使用。
-- `4`: `Qwen3-TTS-12Hz-0.6B-Base-8bit`，最快 fallback。
+**Qwen3-TTS 8-bit**（推荐日常使用）：
 
-完整的 Qwen voice clone 模型目录必须包含：
+| 模型 | 任务 | 大小 | Q/S 分数 |
+|---|---|---|---|
+| Qwen3-TTS-12Hz-1.7B-Base-8bit | Clone | 2.9 GB | Q98/S62 |
+| Qwen3-TTS-12Hz-0.6B-Base-8bit | Clone | 1.9 GB | Q78/S95 |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit | Custom Voice | 3.1 GB | Q100/S61 |
+| Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit | Custom Voice | 2.0 GB | Q82/S94 |
+| Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit | Voice Design | 3.1 GB | Q99/S61 |
 
-```text
-config.json
-model.safetensors
-speech_tokenizer/config.json
-speech_tokenizer/model.safetensors
-```
+**Qwen3-TTS bf16**（最高质量，适合录音级场景）：
 
-如果缺少 `speech_tokenizer/model.safetensors`，Qwen 可能输出近似噪音的音频；当前版本会在加载阶段拦截这个问题。
+| 模型 | 任务 | 大小 | Q/S 分数 |
+|---|---|---|---|
+| Qwen3-TTS-12Hz-1.7B-Base-bf16 | Clone | 5.8 GB | Q100/S50 |
+| Qwen3-TTS-12Hz-0.6B-Base-bf16 | Clone | 3.8 GB | Q82/S80 |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16 | Custom Voice | 5.8 GB | Q100/S50 |
+| Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16 | Custom Voice | 3.8 GB | Q85/S80 |
+| Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16 | Voice Design | 5.8 GB | Q100/S50 |
 
-### Chatterbox 实验后端
+**VoxCPM2 MLX**（48 kHz 高保真）：
 
-Chatterbox 通过独立依赖文件安装，避免 PyTorch/torchaudio 影响当前 MLX 主环境：
+| 模型 | 大小 | Q/S 分数 | 说明 |
+|---|---|---|---|
+| VoxCPM2-8bit | 2.2 GB | Q92/S70 | 推荐，质量/速度平衡 |
+| VoxCPM2-bf16 | 3.8 GB | Q95/S55 | 最高音质 |
+| VoxCPM2-4bit | 1.88 GB | Q85/S90 | 最快，62% 更小 |
+
+### 下载模型
 
 ```bash
-python3.11 -m venv .venv-chatterbox
-source .venv-chatterbox/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-chatterbox.txt
-streamlit run streamlit_app.py
-```
+# 通过 Model Manager
+python3 model_route_cli.py --auto-download --task clone
 
-CLI 对比：
+# 或手动下载
+huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit \
+  --local-dir models/Qwen3-TTS-12Hz-1.7B-Base-8bit
 
-```bash
-.venv-chatterbox/bin/python podcast_generator.py \
-  --backend chatterbox \
-  --model chatterbox-multilingual-v3 \
-  --file 稿件.txt \
-  --ref-audio 我的声音.wav \
-  --ref-text "参考音频里具体说的文字内容"
+huggingface-cli download mlx-community/VoxCPM2-8bit \
+  --local-dir models/VoxCPM2-8bit
 ```
 
 ## 性能参考
@@ -141,22 +238,55 @@ CLI 对比：
 | 1-1.5 分钟 | 约 5-23 分钟 | 波动较大，取决于分段和内存状态 |
 | 10 分钟 | 约 2.5 小时 | 建议固定输出文件名并开启断点续跑 |
 
-长文建议接电运行，减少其它重型应用，并优先使用 `--resume` 保护进度。
+VoxCPM2 MLX 8-bit 在 M2 Pro 上实测约 1.2x RTF（48 kHz），4-bit 约 0.8x RTF。长文建议接电运行，减少其它重型应用，优先使用 `--resume` 保护进度。
+
+## 音频质量保护
+
+v2.1.0 起，生成链路在以下节点强制校验，避免无声失败、断续 burst、尖刺爆音或坏音频静默通过：
+
+| 阶段 | 保护机制 | 触发条件 | 行为 |
+|---|---|---|---|
+| 参考音频清洗 | `prepare_reference_audio_clip` | 参考音频 < 3s / 过静 / 长停顿 / clipping / 找不到连续人声 | 写 `reference_quality.json` 并提前失败 |
+| Profile 保存 | `save_profile` | 上传源声音 | 保存 `reference_original.<ext>`，实际使用 `reference_clean.wav` |
+| 模型加载 | `_validate_voxcpm_model_files` / `_validate_qwen_model_files` | 本地 snapshot 缺关键文件 | `FileNotFoundError` 含可执行指引 |
+| 采样率探测 | `_voxcpm_sample_rate` / `as_tts_result` | 无法识别 sample rate 或 ≤ 0 | `ValueError` 立即停止,绝不静默 fallback |
+| 单段生成 | `check_audio_health(per chunk)` | NaN/Inf / 全静默 / peak ≥ 0.95 / 低 RMS | `[audio warning]` 立即打印,定位到具体段号 |
+| 单段证据 | `_seg_*.wav` | 每段 TTS 生成完成 | 默认保留到 `outputs/.<output_stem>_segments/` |
+| 质量报告 | `quality_report.json` | 每次生成 | 记录 chunk/final 的 RMS、peak、低能量、sample jumps 等指标 |
+| 质量门禁 | `audio_quality_issues` | 爆音跳变、长低能量段、全静默、NaN/Inf、near clipping | 标记 failed，保留报告和 segment 证据 |
+| 跨段一致性 | `expected_sample_rate` 跟踪 | 后端中途切换采样率 | `ValueError` 立即停止,避免播放变速 |
+| 静默裁剪 | `trim_silence` head/tail 守卫 | chunk 短于 head+tail 请求量 | warning + 保留原音频,避免整段被吞 |
+| 交叉淡化 | `crossfade_concat` 动态 fade 收缩 | 段长度 < fade 窗口 | 自动收缩到 `min(requested, len(out), len(s))`,仅 sub-ms 退化到硬切 |
+| 响度限幅 | `limit_audio_peak(ceiling=0.95)` + `check_audio_health(threshold=0.95)` | peak ≥ 0.95 | tanh 软限,失败时立刻告警 |
+| ffmpeg 依赖 | `convert_audio_if_needed` / `convert_wav_to_mp3` | 缺少 ffmpeg | 两者一致 `raise RuntimeError("brew install ffmpeg")` |
+
+历史音频问题已经收敛进当前生成链路：优先使用 Qwen bf16/Base 克隆模型、保留真实 sample rate、拼接前后做健康检查、以 -23 LUFS 做保守响度标准化，并在质量报告中记录参考语速校准、sample jumps、低能量段和最终交付文件指标。
 
 ## 项目结构
 
 ```text
-streamlit_app.py        # 正式 Web app
+streamlit_app.py        # Web 生产台
 podcast_generator.py    # CLI 长文生成
-voice_profiles.py       # 多人源声音 profile 管理
-voice_controls.py       # 表达预设和节奏优化
+tts_backends.py         # Qwen / VoxCPM2 后端封装
+model_manager.py        # 模型下载、更新、路由
 article_extractor.py    # URL 正文抽取
-tts_backends.py         # Qwen/Chatterbox/VoxCPM 后端封装
-audio_samples/          # 本机可选参考音频，默认忽略，只提交 .gitkeep
-voices/profiles/        # 用户保存的声音 profile，默认忽略
-outputs/                # 生成结果，默认忽略
-models/                 # 本地模型，默认忽略
-tests/                  # 单元测试
+voice_profiles.py       # 多人源声音 Profile 管理
+voice_controls.py       # 表达预设和节奏优化
+utils.py                # 音频转换、checkpoint、切分等工具
+app_styles.css          # Streamlit 暗色主题 CSS
+Makefile                # 日常命令 (install/test/lint/clean)
+pyproject.toml          # 项目元数据和工具配置
+model_route_cli.py      # 模型路由 CLI 工具
+benchmark_tts_backends.py # TTS 后端基准对比
+download_model.py       # 手动模型下载脚本
+audio_samples/          # 本机可选参考音频
+voices/profiles/        # 用户保存的声音 Profile
+outputs/                # 生成结果、quality_report.json、.<output>_segments/
+models/                 # 本地模型
+runtime/                # 临时上传文件
+tests/                  # 单元测试 (113 个)
+使用指南.md             # 中文使用指南（保留自 V1.5.7）
+项目交接文档.md         # 项目交接文档（保留自 V1.5.7）
 ```
 
 ## 清理边界
@@ -165,19 +295,25 @@ tests/                  # 单元测试
 
 - `outputs/` 下除 `.gitkeep` 之外的生成结果。
 - `audio_samples/` 下除 `.gitkeep` 之外的个人参考音频。
-- `voices/profiles/` 下除 `.gitkeep` 之外的个人声音 profile。
+- `voices/profiles/` 下不用的个人声音 Profile；正在使用的 Profile 应保留在本机，且默认不会提交到 Git。
 - `runtime/`、缓存、日志、`.DS_Store`、打包产物。
 
 不要清理：
 
 - `models/`：本机运行依赖。
 - `.venv/`：本机 Python 环境。
-- `audio_samples/.gitkeep`：保留目录结构。
-- `voices/.gitkeep` 和 `voices/profiles/.gitkeep`：保留目录结构。
+- `audio_samples/.gitkeep`、`voices/.gitkeep`、`voices/profiles/.gitkeep`：保留目录结构。
 
 ## 验证
 
 ```bash
-.venv/bin/python -m py_compile streamlit_app.py voice_profiles.py voice_controls.py article_extractor.py podcast_generator.py
-.venv/bin/python -m unittest discover -s tests
+# 语法检查
+make lint
+# 或者
+python3 -m py_compile streamlit_app.py voice_profiles.py voice_controls.py article_extractor.py podcast_generator.py tts_backends.py model_manager.py utils.py
+
+# 运行测试
+make test
+# 或者
+python3 -m pytest tests/
 ```

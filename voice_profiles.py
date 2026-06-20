@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+from utils import prepare_reference_pair
+
 
 SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
 
@@ -27,6 +29,10 @@ class VoiceProfile:
     created_at: str = ""
     updated_at: str = ""
     built_in: bool = False
+    schema_version: int = 1
+    legacy: bool = False
+    can_generate: bool = True
+    status: str = "ready"
 
     @property
     def needs_transcript(self) -> bool:
@@ -34,15 +40,41 @@ class VoiceProfile:
 
     @property
     def fingerprint(self) -> str:
-        stat = self.ref_audio_path.stat() if self.ref_audio_path.exists() else None
+        """Stable fingerprint that survives path changes and partial edits.
+
+        Includes the profile id, the ref-audio content hash (NOT the path),
+        the audio size, and the ref-text digest.  This makes checkpoint
+        reuse portable across machines with the same audio file.
+        """
+        stat = None
+        try:
+            stat = self.ref_audio_path.stat() if self.ref_audio_path.exists() else None
+        except OSError:
+            stat = None
         size = stat.st_size if stat else 0
-        mtime = int(stat.st_mtime) if stat else 0
+
+        audio_digest = _sha256_file(self.ref_audio_path) if stat else sha256(b"").hexdigest()
         text_digest = sha256(self.ref_text.strip().encode("utf-8")).hexdigest()
-        return f"{self.id}:{self.ref_audio_path}:{size}:{mtime}:{text_digest}"
+        return f"{self.id}:{audio_digest}:{size}:{text_digest}"
 
 
 def text_fingerprint(text: str) -> str:
     return sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path, chunk_bytes: int = 1 << 20) -> str:
+    """Stream a file through SHA-256 without loading it all into memory."""
+    hasher = sha256()
+    try:
+        with open(path, "rb") as fp:
+            while True:
+                chunk = fp.read(chunk_bytes)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except OSError:
+        return sha256(b"").hexdigest()
+    return hasher.hexdigest()
 
 
 def slugify_profile_id(name: str) -> str:
@@ -69,6 +101,16 @@ def _metadata_path(app_dir: Path, profile_id: str) -> Path:
     return profiles_dir(app_dir) / profile_id / "metadata.json"
 
 
+def _resolve_profile_path(app_dir: Path, profile_path: Path, value: str | None, fallback_name: str) -> Path:
+    raw = value or fallback_name
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if len(path.parts) == 1:
+        return profile_path / path
+    return app_dir / path
+
+
 def _audio_candidates(profile_path: Path) -> Iterable[Path]:
     for path in sorted(profile_path.iterdir()):
         if path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
@@ -79,13 +121,22 @@ def load_profile(app_dir: Path, profile_id: str) -> VoiceProfile:
     metadata_path = _metadata_path(app_dir, profile_id)
     data = json.loads(metadata_path.read_text(encoding="utf-8"))
     profile_path = metadata_path.parent
-    ref_audio_path = Path(data.get("ref_audio_path", ""))
-    if not ref_audio_path.is_absolute():
-        ref_audio_path = app_dir / ref_audio_path
-    ref_text_path_value = data.get("ref_text_path") or "transcript.txt"
-    ref_text_path = Path(ref_text_path_value)
-    if not ref_text_path.is_absolute():
-        ref_text_path = profile_path / ref_text_path
+    schema_version = int(data.get("schema_version", 1) or 1)
+    ref_audio_path = _resolve_profile_path(
+        app_dir,
+        profile_path,
+        data.get("ref_audio_path"),
+        "reference_clean.wav",
+    )
+    ref_text_path = _resolve_profile_path(
+        app_dir,
+        profile_path,
+        data.get("ref_text_path"),
+        "transcript.txt",
+    )
+    legacy = schema_version < 2
+    can_generate = not legacy and ref_audio_path.exists() and ref_text_path.exists()
+    status = "legacy" if legacy else ("ready" if can_generate else "incomplete")
     return VoiceProfile(
         id=data["id"],
         display_name=data.get("display_name") or data["id"],
@@ -97,6 +148,10 @@ def load_profile(app_dir: Path, profile_id: str) -> VoiceProfile:
         created_at=data.get("created_at", ""),
         updated_at=data.get("updated_at", ""),
         built_in=False,
+        schema_version=schema_version,
+        legacy=legacy,
+        can_generate=can_generate,
+        status=status,
     )
 
 
@@ -125,11 +180,10 @@ def save_profile(
     root = profiles_dir(app_dir) / profile_id
     root.mkdir(parents=True, exist_ok=True)
 
-    audio_target = root / f"reference{audio_source.suffix.lower()}"
-    if audio_source.resolve() != audio_target.resolve():
-        shutil.copy2(audio_source, audio_target)
-    transcript_path = root / "transcript.txt"
-    transcript_path.write_text(transcript.strip(), encoding="utf-8")
+    original_target = root / f"reference_original{audio_source.suffix.lower()}"
+    if audio_source.resolve() != original_target.resolve():
+        shutil.copy2(audio_source, original_target)
+    reference_pair = prepare_reference_pair(original_target, transcript, root)
 
     existing_created = ""
     metadata_path = root / "metadata.json"
@@ -140,10 +194,12 @@ def save_profile(
             existing_created = ""
 
     metadata = {
+        "schema_version": 2,
         "id": profile_id,
         "display_name": display_name.strip() or profile_id,
-        "ref_audio_path": str(audio_target.relative_to(app_dir)),
-        "ref_text_path": "transcript.txt",
+        "ref_audio_path": reference_pair.clean_audio_path.name,
+        "ref_text_path": reference_pair.clean_text_path.name,
+        "ref_quality_path": reference_pair.quality_path.name,
         "description": description.strip(),
         "default_preset": default_preset,
         "created_at": existing_created or _now(),
@@ -181,6 +237,10 @@ def _built_in_profiles(app_dir: Path) -> list[VoiceProfile]:
                 ref_text="",
                 description="本机源声音，请补全对应参考文本后使用",
                 built_in=True,
+                schema_version=0,
+                legacy=False,
+                can_generate=False,
+                status="builtin_needs_transcript",
             )
         )
     return profiles

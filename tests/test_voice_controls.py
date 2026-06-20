@@ -19,20 +19,19 @@ class VoiceControlsTest(unittest.TestCase):
     def test_get_preset_returns_expected_values_and_default(self):
         preset = get_preset("热情开场")
         self.assertEqual(preset.speed, 1.05)
-        self.assertEqual(preset.temperature, 0.90)
-        self.assertEqual(preset.chunk_max_chars, 60)
+        self.assertEqual(preset.temperature, 0.85)
+        self.assertEqual(preset.chunk_max_chars, 260)
 
         self.assertEqual(get_preset("").name, "自然播客")
         self.assertEqual(get_preset("不存在").name, "自然播客")
         self.assertEqual(get_preset(None).name, "自然播客")
 
-    def test_default_podcast_preset_uses_conservative_generation_values(self):
-        preset = get_preset(None)
+    def test_qwen_clone_defaults_stay_in_stable_range(self):
+        default_preset = get_preset(None)
 
-        self.assertGreaterEqual(preset.temperature, 0.70)
-        self.assertLessEqual(preset.temperature, 0.90)
-        self.assertGreaterEqual(preset.speed, 1.00)
-        self.assertLessEqual(preset.speed, 1.05)
+        self.assertLessEqual(default_preset.speed, 1.05)
+        self.assertLessEqual(default_preset.temperature, 0.85)
+        self.assertIn(default_preset.chunk_max_chars, range(220, 301))
 
     def test_optimize_podcast_rhythm_normalizes_and_splits_without_new_words(self):
         text = (

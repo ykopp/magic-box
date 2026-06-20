@@ -136,39 +136,49 @@ def extract_article_from_url(url: str, timeout: int = 15) -> ArticleExtraction:
 
 
 def _fetch_article_page(url: str, timeout: int) -> requests.Response:
+    """Fetch article page with UA fallback and SPA detection."""
     attempts = (
-        _browser_headers(url, USER_AGENT),
-        _browser_headers(url, MOBILE_USER_AGENT),
+        _browser_headers(url, USER_AGENT, referer="https://www.google.com/"),
+        _browser_headers(url, MOBILE_USER_AGENT, referer=""),
     )
     last_error: requests.HTTPError | None = None
     for headers in attempts:
         response = requests.get(url, headers=headers, timeout=timeout)
         try:
             response.raise_for_status()
-            return response
         except requests.HTTPError as exc:
-            if response.status_code != 403:
-                raise
-            last_error = exc
-
+            if response.status_code in {403, 429, 503}:
+                last_error = exc
+                continue
+            raise
+        if len(response.content) < 500:
+            raise ValueError(
+                "该页面内容过短，可能是需要 JavaScript 渲染的单页应用（SPA）。"
+            )
+        return response
+    status_text = (
+        f"HTTP {last_error.response.status_code}"
+        if getattr(last_error, "response", None) is not None
+        else "unknown"
+    )
     raise ValueError(
-        "该网站拒绝自动抓取正文（HTTP 403）。可以尝试换一个公开文章链接，"
-        "或直接复制网页正文到“手动输入”。"
-    ) from last_error
+        f"该网站拒绝自动抓取正文（{status_text}）。"
+    )
 
 
-def _browser_headers(url: str, user_agent: str) -> dict[str, str]:
-    parsed = urlparse(url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    return {
+def _browser_headers(url: str, user_agent: str, referer: str = "") -> dict[str, str]:
+    """Build browser headers with optional Referer for UA rotation."""
+    headers: dict[str, str] = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-        "Referer": origin,
         "Upgrade-Insecure-Requests": "1",
     }
+    if referer:
+        headers["Referer"] = referer
+    return headers
 
 
 def clean_article_for_podcast(title: str, text: str) -> str:
@@ -210,7 +220,17 @@ def _extract_title(document: "HtmlElement") -> str:
     ):
         values = document.xpath(xpath)
         for value in values:
-            title = _clean_inline(value if isinstance(value, str) else value.text_content())
+            # ``document.xpath`` may return:
+            #   - str (text nodes)
+            #   - _ElementUnicodeResult (attribute strings, also ``str``-like)
+            #   - _Element (subtrees)
+            # _ElementUnicodeResult does not implement ``text_content``.
+            if isinstance(value, str):
+                title = _clean_inline(value)
+            elif hasattr(value, "text_content") and callable(value.text_content):
+                title = _clean_inline(value.text_content())
+            else:
+                title = _clean_inline(str(value))
             if title:
                 return title
     return "未命名文章"

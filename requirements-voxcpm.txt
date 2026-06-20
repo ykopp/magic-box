@@ -1,7 +1,8 @@
-# Optional, isolated VoxCPM experiment dependencies.
+# VoxCPM2 is now MLX-native (mlx-community/VoxCPM2-*).
+# No PyTorch / torchaudio / einops required.
 #
-# Do not install this into the default Qwen/MLX production environment unless
-# you explicitly want to test backend=voxcpm. These PyTorch packages are larger
-# and have a different compatibility surface from the Apple Silicon MLX path.
-
--e ../VoxCPM
+# The MLX backend loads VoxCPM2 via mlx-audio just like Qwen.
+# To download a VoxCPM2 MLX model:
+#   huggingface-cli download mlx-community/VoxCPM2-8bit --local-dir models/VoxCPM2-8bit
+#
+# Or use the Model Manager in the Streamlit UI (magic-box-route tool).

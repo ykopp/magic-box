@@ -12,21 +12,11 @@ MODELS_DIR = "models"
 
 MODELS = {
     "1": {
-        "name": "Qwen3-TTS-12Hz-1.7B-Base-bf16",
-        "repo": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
-        "desc": "Voice Cloning (Pro bf16 - 1.7B, higher fidelity)"
-    },
-    "2": {
-        "name": "Qwen3-TTS-12Hz-0.6B-Base-bf16",
-        "repo": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
-        "desc": "Voice Cloning (Lite bf16 - 0.6B, stable fallback)"
-    },
-    "3": {
         "name": "Qwen3-TTS-12Hz-1.7B-Base-8bit",
         "repo": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         "desc": "Voice Cloning (Pro - 1.7B)"
     },
-    "4": {
+    "2": {
         "name": "Qwen3-TTS-12Hz-0.6B-Base-8bit",
         "repo": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
         "desc": "Voice Cloning (Lite - 0.6B)"
@@ -91,9 +81,8 @@ def print_model_list():
     for key, info in MODELS.items():
         print(f"  {key}. {info['desc']}")
     print("\n推荐下载:")
-    print("  - 1.7B Base bf16: 主力高保真 voice cloning")
-    print("  - 0.6B Base bf16: 速度/内存优先的稳定备选")
-    print("  - 8bit: 磁盘/内存紧张时使用")
+    print("  - 1.7B Base: 主力 voice cloning")
+    print("  - 0.6B Base: 速度/内存优先")
     print("="*50)
 
 

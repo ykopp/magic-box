@@ -124,7 +124,8 @@ class ArticleExtractorTests(unittest.TestCase):
             extract_article_from_url("file:///tmp/article.html")
 
     def test_raises_when_text_is_too_short(self):
-        html = "<html><head><title>Tiny</title></head><body><main><p>Too short.</p></main></body></html>"
+        html = ("<html><head><title>Tiny</title></head><body><main><p>Too short.</p></main></body></html>"
+                + "<!-- " + "x" * 500 + " -->")
 
         with patch("article_extractor.requests.get", fake_get_factory(html)):
             with self.assertRaisesRegex(ValueError, "足够的正文内容"):
@@ -132,17 +133,16 @@ class ArticleExtractorTests(unittest.TestCase):
 
     def test_wraps_empty_page_parse_errors(self):
         with patch("article_extractor.requests.get", fake_get_factory(b"")):
-            with self.assertRaisesRegex(ValueError, "无法解析"):
+            with self.assertRaisesRegex(ValueError, "内容过短|SPA"):
                 extract_article_from_url("https://example.com/empty")
 
     def test_retries_403_with_mobile_headers(self):
-        html = """
-        <html><head><title>Retry Title</title></head><body><article>
-          <p>First paragraph with enough article content for extraction after a mobile retry succeeds.</p>
-          <p>Second paragraph with enough article content for extraction after a mobile retry succeeds.</p>
-          <p>Third paragraph with enough article content for extraction after a mobile retry succeeds.</p>
-        </article></body></html>
-        """
+        html = ("<html><head><title>Retry Title</title></head><body><article>"
+                + "<!-- " + "x" * 600 + " -->"
+                + "<p>First paragraph with enough article content for extraction after a mobile retry succeeds.</p>"
+                + "<p>Second paragraph with enough article content for extraction after a mobile retry succeeds.</p>"
+                + "<p>Third paragraph with enough article content for extraction after a mobile retry succeeds.</p>"
+                + "</article></body></html>")
         fake_get = fake_sequence_factory([FakeResponse("Forbidden", status_code=403), FakeResponse(html)])
 
         with patch("article_extractor.requests.get", fake_get):
@@ -163,6 +163,47 @@ class ArticleExtractorTests(unittest.TestCase):
                 extract_article_from_url("https://example.com/blocked")
 
         self.assertEqual(len(fake_get.calls), 2)
+
+    def test_raises_on_timeout(self):
+        def fake_get(url, headers=None, timeout=None):
+            raise requests.exceptions.Timeout("simulated timeout")
+
+        with patch("article_extractor.requests.get", fake_get):
+            with self.assertRaises(requests.exceptions.Timeout):
+                extract_article_from_url("https://example.com/slow")
+
+    def test_raises_on_ssl_error(self):
+        def fake_get(url, headers=None, timeout=None):
+            raise requests.exceptions.SSLError("simulated SSL failure")
+
+        with patch("article_extractor.requests.get", fake_get):
+            with self.assertRaises(requests.exceptions.SSLError):
+                extract_article_from_url("https://example.com/ssl")
+
+    def test_raises_on_non_html_payload(self):
+        # A short JSON response is below the SPA-detection threshold and
+        # also contains no <article> markers, so it should hit the
+        # "not enough text" branch.
+        json_payload = b'{"items": []}'
+
+        with patch("article_extractor.requests.get", fake_get_factory(json_payload)):
+            with self.assertRaisesRegex(ValueError, "内容过短|正文内容"):
+                extract_article_from_url("https://example.com/json")
+
+    def test_429_also_triggers_retry(self):
+        html = ("<html><head><title>Rate Limited</title></head><body><article>"
+                + "<!-- " + "x" * 600 + " -->"
+                + "<p>First paragraph with enough article content after a 429 retry succeeds.</p>"
+                + "<p>Second paragraph with enough article content after a 429 retry succeeds.</p>"
+                + "<p>Third paragraph with enough article content after a 429 retry succeeds.</p>"
+                + "</article></body></html>")
+        fake_get = fake_sequence_factory([FakeResponse("Too Many Requests", status_code=429), FakeResponse(html)])
+
+        with patch("article_extractor.requests.get", fake_get):
+            result = extract_article_from_url("https://example.com/rate-limited")
+
+        self.assertEqual(len(fake_get.calls), 2)
+        self.assertEqual(result.title, "Rate Limited")
 
 
 if __name__ == "__main__":

@@ -1,30 +1,40 @@
+import logging
 import os
-import sys
+import shutil
+import tempfile
 import time
-import importlib.util
-import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numpy as np
+from packaging.version import InvalidVersion, Version
 
-from utils import SAMPLE_RATE, convert_audio_if_needed, get_smart_path, model_cache
+from utils import RUNTIME_DIR, SAMPLE_RATE, ReferenceAudioError, prepare_reference_audio_clip, get_smart_path, model_cache
+
+try:
+    from utils import prepare_reference_pair as _prepare_reference_pair
+except ImportError:  # pragma: no cover - forward-compatible optional hook
+    _prepare_reference_pair = None
+
+try:
+    from utils import audit_reference_audio as _audit_reference_audio
+except ImportError:  # pragma: no cover - forward-compatible optional hook
+    _audit_reference_audio = None
+
+_log = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 QWEN_DIR = Path(__file__).resolve().parent
-VOXCPM_DIR = WORKSPACE_ROOT / "VoxCPM"
-VOXCPM_SRC_DIR = VOXCPM_DIR / "src"
+MIN_MLX_AUDIO_VERSION = Version("0.4.3")
 
-QWEN_DEFAULT_MODEL = str(QWEN_DIR / "models" / "Qwen3-TTS-12Hz-1.7B-Base-8bit")
-VOXCPM_DEFAULT_MODEL = "openbmb/VoxCPM2"
-CHATTERBOX_MULTILINGUAL_MODEL = "chatterbox-multilingual-v3"
-CHATTERBOX_TURBO_MODEL = "chatterbox-turbo"
-CHATTERBOX_ENGLISH_MODEL = "chatterbox-english"
+QWEN_DEFAULT_MODEL = "Qwen3-TTS-12Hz-1.7B-Base-bf16"
+VOXCPM_DEFAULT_MODEL = "mlx-community/VoxCPM2-8bit"
 QWEN_DEFAULT_MODEL_PRIORITY = [
     "Qwen3-TTS-12Hz-1.7B-Base-bf16",
-    "Qwen3-TTS-12Hz-0.6B-Base-bf16",
     "Qwen3-TTS-12Hz-1.7B-Base-8bit",
+    "Qwen3-TTS-12Hz-0.6B-Base-bf16",
     "Qwen3-TTS-12Hz-0.6B-Base-8bit",
 ]
 
@@ -36,9 +46,6 @@ QWEN_TASK_CHOICES = [
 VOXCPM_TASK_CHOICES = [
     ("Voice Clone", "clone"),
     ("Voice Design", "design"),
-]
-CHATTERBOX_TASK_CHOICES = [
-    ("Voice Clone", "clone"),
 ]
 
 QWEN_OBJECTIVE_CHOICES = [
@@ -53,6 +60,44 @@ QWEN_REQUIRED_MODEL_FILES = (
     "speech_tokenizer/config.json",
     "speech_tokenizer/model.safetensors",
 )
+# VoxCPM2 MLX snapshot layout (mlx-community/VoxCPM2-*): at minimum we need
+# a config.json to load tokenizer/audio-vae metadata. The full safetensors
+# shard set varies by quantization, so we only assert on files that exist
+# for every published variant.
+VOXCPM_REQUIRED_MODEL_FILES = (
+    "config.json",
+)
+
+
+def _get_package_version(package_name: str) -> str | None:
+    try:
+        return package_version(package_name)
+    except PackageNotFoundError:
+        return None
+
+
+def validate_mlx_audio_runtime() -> None:
+    """Fail early when the active Python env cannot run the current TTS stack."""
+    installed = _get_package_version("mlx-audio")
+    if installed is None:
+        raise RuntimeError(
+            "当前 Python 环境没有安装 mlx-audio。请在项目目录运行: "
+            "./.venv/bin/python -m streamlit run streamlit_app.py --server.port 8507"
+        )
+
+    try:
+        parsed = Version(installed)
+    except InvalidVersion as exc:
+        raise RuntimeError(f"无法识别 mlx-audio 版本: {installed}") from exc
+
+    if parsed < MIN_MLX_AUDIO_VERSION:
+        raise RuntimeError(
+            f"当前 Python 环境的 mlx-audio=={installed}, 低于项目要求 "
+            f">={MIN_MLX_AUDIO_VERSION}. 旧版会导致 Qwen speech tokenizer encoder "
+            "不可用, 生成音频出现固定空洞/断续。请使用项目虚拟环境启动: "
+            "cd '/Users/liuchang/Apprun/chenxi/Magic Box' && "
+            "./.venv/bin/python -m streamlit run streamlit_app.py --server.port 8507"
+        )
 
 
 @dataclass
@@ -79,6 +124,29 @@ class TTSGenerationResult:
         return len(self.audio)
 
 
+@dataclass
+class PreparedReference:
+    """Audited reference audio paired with the transcript used for cloning."""
+
+    clean_audio_path: str
+    clean_ref_text: Optional[str] = None
+    quality_report_path: Optional[str] = None
+    audit: dict[str, Any] | None = None
+    source_audio_path: Optional[str] = None
+    runtime_dir: Optional[str] = None
+
+    def __str__(self) -> str:
+        return self.clean_audio_path
+
+    def __fspath__(self) -> str:
+        return self.clean_audio_path
+
+    def to_report_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["audit"] = self.audit or {}
+        return payload
+
+
 def as_tts_result(result, default_sample_rate: int = SAMPLE_RATE) -> TTSGenerationResult:
     """Return a TTSGenerationResult from backend-native output or old ndarray output."""
 
@@ -92,7 +160,40 @@ def as_tts_result(result, default_sample_rate: int = SAMPLE_RATE) -> TTSGenerati
         or getattr(result, "sr", None)
         or default_sample_rate
     )
-    return TTSGenerationResult(audio=np.asarray(audio), sample_rate=int(sample_rate))
+    sample_rate_int = int(sample_rate) if sample_rate else 0
+    if sample_rate_int <= 0:
+        raise ValueError(
+            "TTS result has no detectable sample rate and no valid default. "
+            "Audio cannot be saved with a correct sample rate — refusing to "
+            "write back the wrong value. Pass an explicit default_sample_rate "
+            "or ensure the result exposes 'sample_rate' / 'sampling_rate' / 'sr'."
+        )
+    return TTSGenerationResult(audio=np.asarray(audio), sample_rate=sample_rate_int)
+
+
+def _combine_tts_results(
+    results: list,
+    *,
+    default_sample_rate: int = SAMPLE_RATE,
+    backend_label: str,
+) -> TTSGenerationResult:
+    if not results:
+        raise RuntimeError(f"{backend_label} returned no audio")
+
+    converted = [as_tts_result(result, default_sample_rate=default_sample_rate) for result in results]
+    sample_rate = converted[0].sample_rate
+    for result in converted[1:]:
+        if result.sample_rate != sample_rate:
+            raise ValueError(
+                f"{backend_label} returned inconsistent sample rates: "
+                f"{sample_rate} and {result.sample_rate}"
+            )
+    if len(converted) == 1:
+        return converted[0]
+    return TTSGenerationResult(
+        audio=np.concatenate([np.asarray(result.audio) for result in converted]),
+        sample_rate=sample_rate,
+    )
 
 
 def _read_nested_value(obj, path: str):
@@ -118,7 +219,21 @@ def _normalise_sample_rate(value) -> Optional[int]:
 
 
 def _voxcpm_sample_rate(model) -> int:
-    """Best-effort VoxCPM output sample-rate discovery from model/config objects."""
+    """Best-effort VoxCPM output sample-rate discovery.
+
+    MLX VoxCPM2 exposes ``model.sample_rate`` directly (48 kHz).
+    Fallback to nested probing for older/alternative models.
+
+    Raises ``ValueError`` when no sample rate can be detected. Silently
+    defaulting to the project ``SAMPLE_RATE`` (24 kHz) when the actual model
+    runs at 48 kHz would cause the WAV to be tagged with the wrong rate and
+    play back at half speed — explicitly failing is safer.
+    """
+    # MLX VoxCPM2: sample_rate on model object
+    if hasattr(model, "sample_rate") and isinstance(getattr(model, "sample_rate"), (int, float)):
+        sr = int(getattr(model, "sample_rate"))
+        if sr > 0:
+            return sr
 
     sample_rate_paths = (
         "sample_rate",
@@ -137,37 +252,58 @@ def _voxcpm_sample_rate(model) -> int:
         "config.audio_vae_config.sampling_rate",
     )
     for path in sample_rate_paths:
-        sample_rate = _normalise_sample_rate(_read_nested_value(model, path))
-        if sample_rate is not None:
-            return sample_rate
-    return SAMPLE_RATE
+        candidate = _normalise_sample_rate(_read_nested_value(model, path))
+        if candidate is not None:
+            return candidate
+    raise ValueError(
+        "VoxCPM 模型无法识别输出采样率 — 无法保证音频以正确速率写入 WAV。 "
+        "请确认模型对象暴露 sample_rate / sampling_rate / sr 属性，或者在 "
+        "_voxcpm_sample_rate 中补充该模型变体的探测路径。已知 VoxCPM2 输出 "
+        f"为 48 kHz，而项目默认 SAMPLE_RATE={SAMPLE_RATE} 仅为 24 kHz；若不"
+        "修复，输出会被错标为 24 kHz，导致播放速度减半。"
+    )
 
 
 def supported_task_choices(backend: str):
-    if backend == "qwen":
-        return QWEN_TASK_CHOICES
-    if backend == "chatterbox":
-        return CHATTERBOX_TASK_CHOICES
-    return VOXCPM_TASK_CHOICES
+    return QWEN_TASK_CHOICES if backend == "qwen" else VOXCPM_TASK_CHOICES
 
 
 def backend_note(backend: str) -> str:
     if backend == "voxcpm":
-        return "VoxCPM 实验后端: Custom Voice / Qwen 路由不可用，speed/temperature 将被忽略。"
-    if backend == "chatterbox":
-        return "Chatterbox 实验后端: 支持参考音频克隆；建议用独立环境安装 chatterbox-tts。"
+        return (
+            "VoxCPM2 MLX 后端 (2026.04): 2B 参数, 48 kHz 输出, "
+            "30 语言 + 9 方言, Voice Design + Clone + Ultimate Clone。"
+            "speed/temperature 暂不支持。"
+        )
     return "Qwen 主线后端: 支持模型路由、speed/temperature、长文主工作流。"
 
 
 def _discover_voxcpm_local_models() -> List[BackendModelChoice]:
+    """Discover locally-downloaded MLX VoxCPM models in the project models dir."""
     choices: List[BackendModelChoice] = []
-    models_root = VOXCPM_DIR / "models"
-    if models_root.exists():
-        for model_dir in sorted(models_root.iterdir()):
+    from model_manager import model_manager
+
+    if model_manager is not None:
+        for model in model_manager.get_available_models():
+            if not model.downloaded or not model.local_path:
+                continue
+            # MLX VoxCPM2 models are stored under model_manager's project dir
+            if "voxcpm" in model.name.lower() or "voxcpm" in model.repo_id.lower():
+                choices.append(
+                    BackendModelChoice(
+                        label=f"{model.name} | {model.source} | Q{model.quality_score}",
+                        value=str(model.local_path),
+                    )
+                )
+
+    # Also scan the old VoxCPM dir for local models (backwards compat)
+    legacy_dir = WORKSPACE_ROOT / "VoxCPM" / "models"
+    if legacy_dir.exists():
+        for model_dir in sorted(legacy_dir.iterdir()):
             if (model_dir / "config.json").exists():
                 choices.append(
                     BackendModelChoice(
-                        label=f"{model_dir.name} | project",
+                        label=f"{model_dir.name} | legacy",
                         value=str(model_dir),
                     )
                 )
@@ -175,31 +311,28 @@ def _discover_voxcpm_local_models() -> List[BackendModelChoice]:
 
 
 def get_voxcpm_model_choices() -> List[BackendModelChoice]:
+    """Return available MLX VoxCPM2 model choices."""
     choices = _discover_voxcpm_local_models()
-    remote = BackendModelChoice(
-        label="openbmb/VoxCPM2 | remote(default)",
-        value=VOXCPM_DEFAULT_MODEL,
-    )
-    if not any(choice.value == remote.value for choice in choices):
-        choices.insert(0, remote)
-    return choices
 
-
-def get_chatterbox_model_choices() -> List[BackendModelChoice]:
-    return [
+    # MLX-community quantized variants, ordered by quality
+    remote_variants = [
         BackendModelChoice(
-            label="Chatterbox Multilingual V3 | experimental | 23+ languages",
-            value=CHATTERBOX_MULTILINGUAL_MODEL,
+            label="VoxCPM2-8bit | mlx-community(recommended)",
+            value="mlx-community/VoxCPM2-8bit",
         ),
         BackendModelChoice(
-            label="Chatterbox Turbo | experimental | English low-latency",
-            value=CHATTERBOX_TURBO_MODEL,
+            label="VoxCPM2-bf16 | mlx-community(best quality)",
+            value="mlx-community/VoxCPM2-bf16",
         ),
         BackendModelChoice(
-            label="Chatterbox English | experimental",
-            value=CHATTERBOX_ENGLISH_MODEL,
+            label="VoxCPM2-4bit | mlx-community(fastest)",
+            value="mlx-community/VoxCPM2-4bit",
         ),
     ]
+    for variant in remote_variants:
+        if not any(choice.value == variant.value for choice in choices):
+            choices.append(variant)
+    return choices
 
 
 def get_qwen_model_choices():
@@ -224,11 +357,7 @@ def get_qwen_model_choices():
 
 
 def get_backend_model_choices(backend: str) -> List[BackendModelChoice]:
-    if backend == "qwen":
-        return get_qwen_model_choices()
-    if backend == "chatterbox":
-        return get_chatterbox_model_choices()
-    return get_voxcpm_model_choices()
+    return get_qwen_model_choices() if backend == "qwen" else get_voxcpm_model_choices()
 
 
 def get_default_model_ref(backend: str) -> str:
@@ -240,96 +369,22 @@ def get_default_model_ref(backend: str) -> str:
                     if pref in choice.value or pref in choice.label:
                         return choice.value
         return choices[0].value
-    if backend == "qwen":
-        return QWEN_DEFAULT_MODEL
-    if backend == "chatterbox":
-        return CHATTERBOX_MULTILINGUAL_MODEL
-    return VOXCPM_DEFAULT_MODEL
+    return QWEN_DEFAULT_MODEL if backend == "qwen" else VOXCPM_DEFAULT_MODEL
 
 
-def _ensure_voxcpm_import():
-    missing = [
-        module
-        for module in ("torch", "torchaudio", "einops")
-        if importlib.util.find_spec(module) is None
-    ]
-    if missing:
-        raise RuntimeError(
-            "VoxCPM experimental backend is not installed in this environment. "
-            f"Missing: {', '.join(missing)}. "
-            "Keep using backend=qwen, or create an isolated VoxCPM environment with "
-            "`pip install -r requirements-voxcpm.txt`."
-        )
+def _load_qwen_model(model_ref: str):
+    validate_mlx_audio_runtime()
 
-    if str(VOXCPM_SRC_DIR) not in sys.path:
-        sys.path.insert(0, str(VOXCPM_SRC_DIR))
-    try:
-        from voxcpm import VoxCPM
-    except Exception as exc:
-        raise RuntimeError(
-            "VoxCPM experimental backend failed to import. "
-            "Use backend=qwen for production, or install VoxCPM dependencies in an isolated environment."
-        ) from exc
-
-    return VoxCPM
-
-
-def _ensure_chatterbox_import(model_ref: str):
-    missing = [
-        module
-        for module in ("torch", "torchaudio")
-        if importlib.util.find_spec(module) is None
-    ]
-    if importlib.util.find_spec("chatterbox") is None:
-        missing.append("chatterbox-tts")
-    if missing:
-        raise RuntimeError(
-            "Chatterbox experimental backend is not installed in this environment. "
-            f"Missing: {', '.join(missing)}. "
-            "Create an isolated Chatterbox environment and install `pip install chatterbox-tts`, "
-            "or keep using backend=qwen."
-        )
-
-    if model_ref == CHATTERBOX_TURBO_MODEL:
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-
-        return ChatterboxTurboTTS
-    if model_ref == CHATTERBOX_ENGLISH_MODEL:
-        from chatterbox.tts import ChatterboxTTS
-
-        return ChatterboxTTS
-
-    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-
-    return ChatterboxMultilingualTTS
-
-
-def _best_torch_device() -> str:
-    try:
-        import torch
-
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
-
-
-def _load_qwen_model(model_ref: str, task_mode: Optional[str] = None):
     from mlx_audio.tts.utils import load_model
     from transformers.utils import logging as transformers_logging
 
     smart_path = get_smart_path(model_ref) if isinstance(model_ref, str) else model_ref
     if not smart_path or not Path(smart_path).exists():
         raise FileNotFoundError(f"模型未找到: {model_ref}")
-    _validate_qwen_model_files(str(smart_path), require_base_model=task_mode == "clone")
+    _validate_qwen_model_files(str(smart_path))
 
     resolved = str(Path(smart_path).resolve())
-    cache_token = get_backend_model_cache_token("qwen", resolved)
-    cache_key = f"{resolved}::{cache_token}" if cache_token else resolved
-    cached = model_cache.get(cache_key)
+    cached = model_cache.get(resolved)
     if cached is not None:
         return cached, resolved
 
@@ -341,56 +396,11 @@ def _load_qwen_model(model_ref: str, task_mode: Optional[str] = None):
     finally:
         transformers_logging.set_verbosity(original_verbosity)
 
-    model_cache.set(cache_key, model)
+    model_cache.set(resolved, model)
     return model, resolved
 
 
-def get_backend_model_cache_token(backend: str, model_ref: str) -> str:
-    """Return a stable cache token that changes when local model files change."""
-
-    if backend != "qwen":
-        return str(model_ref)
-
-    smart_path = get_smart_path(model_ref) if isinstance(model_ref, str) else model_ref
-    if not smart_path:
-        return str(model_ref)
-
-    path = Path(smart_path)
-    mtimes: list[str] = []
-    for rel_path in QWEN_REQUIRED_MODEL_FILES:
-        candidate = path / rel_path
-        if candidate.exists():
-            mtimes.append(f"{rel_path}:{candidate.stat().st_mtime_ns}")
-    return "|".join(mtimes) if mtimes else str(path)
-
-
-def _read_qwen_model_config(model_path: str) -> dict:
-    config_path = Path(model_path) / "config.json"
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Qwen 模型 config.json 不是有效 JSON: {config_path}") from exc
-    if not isinstance(config, dict):
-        raise ValueError(f"Qwen 模型 config.json 必须是对象: {config_path}")
-    return config
-
-
-def _get_qwen_model_type_from_config(model_path: str) -> str:
-    config = _read_qwen_model_config(model_path)
-    model_type = config.get("tts_model_type", "base")
-    return str(model_type).strip().lower() if model_type is not None else ""
-
-
-def _validate_qwen_base_clone_config(model_path: str):
-    model_type = _get_qwen_model_type_from_config(model_path)
-    if model_type != "base":
-        raise ValueError(
-            f"模型类型 {model_type!r} 不支持参考音频克隆。"
-            "请在克隆声音主流程中选择 Qwen3-TTS Base 模型。"
-        )
-
-
-def _validate_qwen_model_files(model_path: str, require_base_model: bool = False):
+def _validate_qwen_model_files(model_path: str):
     path = Path(model_path)
     missing = [file for file in QWEN_REQUIRED_MODEL_FILES if not (path / file).exists()]
     if missing:
@@ -399,52 +409,58 @@ def _validate_qwen_model_files(model_path: str, require_base_model: bool = False
             f"Qwen 模型目录不完整: {path}. 缺失: {missing_list}. "
             "请重新运行 download_model.py 下载完整模型；缺少 speech_tokenizer 权重会导致输出变成噪音。"
         )
-    if require_base_model:
-        _validate_qwen_base_clone_config(str(path))
+
+
+def _validate_voxcpm_model_files(model_path: str):
+    """Best-effort validation for a *local* VoxCPM2 snapshot.
+
+    For HF repo ids we cannot enumerate files ahead of time, so this is a
+    no-op and ``load_model`` is allowed to fail with its own error.
+    """
+    path = Path(model_path)
+    if not path.exists() or not path.is_dir():
+        return
+    missing = [file for file in VOXCPM_REQUIRED_MODEL_FILES if not (path / file).exists()]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise FileNotFoundError(
+            f"VoxCPM 模型目录不完整: {path}. 缺失: {missing_list}. "
+            "请重新运行 download_model.py 下载完整模型；缺少 config.json 会导致 "
+            "load_model 失败且错误信息晦涩。"
+        )
 
 
 def _load_voxcpm_model(model_ref: str):
-    VoxCPM = _ensure_voxcpm_import()
-    cache_key = f"voxcpm::{model_ref}"
+    """Load VoxCPM2 via MLX (same codepath as Qwen)."""
+    validate_mlx_audio_runtime()
+
+    from mlx_audio.tts.utils import load_model
+
+    smart_path = get_smart_path(model_ref) if isinstance(model_ref, str) else model_ref
+    if not smart_path or not Path(smart_path).exists():
+        smart_path = model_ref  # HF repo id — let mlx_audio handle download
+
+    resolved = str(Path(smart_path).resolve() if Path(smart_path).exists() else smart_path)
+    cache_key = f"voxcpm::mlx::{resolved}"
     cached = model_cache.get(cache_key)
     if cached is not None:
         return cached, cache_key
 
-    model = VoxCPM.from_pretrained(
-        hf_model_id=model_ref,
-        load_denoiser=False,
-        optimize=False,
-    )
+    # Validate the local snapshot *before* hitting mlx_audio so a missing
+    # config.json produces a clear, actionable error (mirrors the Qwen path).
+    if Path(smart_path).exists() and Path(smart_path).is_dir():
+        _validate_voxcpm_model_files(str(smart_path))
+
+    model = load_model(resolved)
     model_cache.set(cache_key, model)
     return model, cache_key
 
 
-def _load_chatterbox_model(model_ref: str):
-    model_ref = model_ref or CHATTERBOX_MULTILINGUAL_MODEL
-    model_cls = _ensure_chatterbox_import(model_ref)
-    device = _best_torch_device()
-    cache_key = f"chatterbox::{model_ref}::{device}"
-    cached = model_cache.get(cache_key)
-    if cached is not None:
-        return cached, cache_key
-
-    if model_ref == CHATTERBOX_MULTILINGUAL_MODEL:
-        model = model_cls.from_pretrained(device=device, t3_model="v3")
-    else:
-        model = model_cls.from_pretrained(device=device)
-    model_cache.set(cache_key, model)
-    return model, cache_key
-
-
-def load_backend_model(backend: str, model_ref: str, task_mode: Optional[str] = None):
+def load_backend_model(backend: str, model_ref: str):
     if backend == "qwen":
-        return _load_qwen_model(model_ref, task_mode=task_mode)
+        return _load_qwen_model(model_ref)
     if backend == "voxcpm":
         return _load_voxcpm_model(model_ref)
-    if backend == "chatterbox":
-        if task_mode and task_mode != "clone":
-            raise ValueError("Chatterbox backend only supports voice clone task.")
-        return _load_chatterbox_model(model_ref)
     raise ValueError(f"Unsupported backend: {backend}")
 
 
@@ -462,7 +478,6 @@ def generate_qwen_chunk(
 ) -> TTSGenerationResult:
     if task_mode == "clone":
         model_type = getattr(getattr(model, "config", None), "tts_model_type", "base")
-        model_type = str(model_type).strip().lower()
         if model_type != "base":
             raise ValueError(
                 f"模型类型 {model_type!r} 不支持参考音频克隆。"
@@ -499,14 +514,7 @@ def generate_qwen_chunk(
     else:
         raise ValueError(f"Qwen backend does not support task: {task_mode}")
 
-    if not results:
-        raise RuntimeError("Qwen backend returned no audio")
-    return as_tts_result(results[0])
-
-
-def _build_voxcpm_design_text(chunk: str, design_instruction: str) -> str:
-    instruction = (design_instruction or "").strip()
-    return f"({instruction}){chunk}" if instruction else chunk
+    return _combine_tts_results(results, backend_label="Qwen backend")
 
 
 def generate_voxcpm_chunk(
@@ -520,79 +528,40 @@ def generate_voxcpm_chunk(
     if task_mode == "custom":
         raise ValueError("VoxCPM backend does not support the custom speaker task.")
 
+    # MLX VoxCPM2 exposes sample_rate directly on the model object
     default_sample_rate = _voxcpm_sample_rate(model)
 
     if task_mode == "design":
-        return as_tts_result(
-            model.generate(
-                text=_build_voxcpm_design_text(chunk, design_instruction),
-                cfg_value=2.0,
-                inference_timesteps=10,
-            ),
-            default_sample_rate=default_sample_rate,
+        # MLX VoxCPM2 voice design: pass instruction as `instruct` kwarg
+        result = model.generate(
+            text=chunk,
+            instruct=(design_instruction or "").strip(),
         )
+        if not isinstance(result, np.ndarray) and not hasattr(result, "audio"):
+            result = _combine_tts_results(
+                list(result),
+                default_sample_rate=default_sample_rate,
+                backend_label="VoxCPM backend",
+            )
+        return as_tts_result(result, default_sample_rate=default_sample_rate)
 
     if task_mode == "clone":
-        kwargs = {
+        kwargs: dict = {
             "text": chunk,
-            "reference_wav_path": ref_audio_path,
-            "cfg_value": 2.0,
-            "inference_timesteps": 10,
+            "ref_audio": ref_audio_path,
         }
-        if ref_text and ref_text.strip() and ref_text.strip() != ".":
-            kwargs["prompt_wav_path"] = ref_audio_path
-            kwargs["prompt_text"] = ref_text
-        return as_tts_result(model.generate(**kwargs), default_sample_rate=default_sample_rate)
+        if ref_text and ref_text.strip():
+            kwargs["ref_text"] = ref_text
+        result = model.generate(**kwargs)
+        if not isinstance(result, np.ndarray) and not hasattr(result, "audio"):
+            result = _combine_tts_results(
+                list(result),
+                default_sample_rate=default_sample_rate,
+                backend_label="VoxCPM backend",
+            )
+        return as_tts_result(result, default_sample_rate=default_sample_rate)
 
     raise ValueError(f"VoxCPM backend does not support task: {task_mode}")
-
-
-def _contains_cjk(text: str) -> bool:
-    return any("\u4e00" <= char <= "\u9fff" for char in text)
-
-
-def _chatterbox_language_id(chunk: str, ref_text: Optional[str]) -> str:
-    combined = f"{ref_text or ''}\n{chunk or ''}"
-    return "zh" if _contains_cjk(combined) else "en"
-
-
-def _audio_to_numpy(audio) -> np.ndarray:
-    if hasattr(audio, "detach"):
-        audio = audio.detach()
-    if hasattr(audio, "cpu"):
-        audio = audio.cpu()
-    if hasattr(audio, "numpy"):
-        audio = audio.numpy()
-    arr = np.asarray(audio, dtype=np.float32)
-    return np.squeeze(arr)
-
-
-def generate_chatterbox_chunk(
-    model,
-    task_mode: str,
-    chunk: str,
-    ref_audio_path: Optional[str],
-    ref_text: Optional[str],
-    speed: float,
-    temperature: float,
-) -> TTSGenerationResult:
-    if task_mode != "clone":
-        raise ValueError("Chatterbox backend only supports voice clone task.")
-    if not ref_audio_path:
-        raise ValueError("Chatterbox voice clone requires ref_audio_path.")
-
-    kwargs = {"audio_prompt_path": ref_audio_path}
-    module_name = model.__class__.__module__
-    if "mtl_tts" in module_name:
-        kwargs["language_id"] = _chatterbox_language_id(chunk, ref_text)
-    if "tts_turbo" not in module_name:
-        kwargs["cfg_weight"] = 0.3 if speed > 1.15 else 0.5
-    if temperature > 1.0 and "tts_turbo" not in module_name:
-        kwargs["exaggeration"] = min(0.8, 0.5 + (temperature - 1.0) * 0.2)
-
-    audio = model.generate(chunk, **kwargs)
-    sample_rate = int(getattr(model, "sr", None) or getattr(model, "sample_rate", None) or SAMPLE_RATE)
-    return TTSGenerationResult(audio=_audio_to_numpy(audio), sample_rate=sample_rate)
 
 
 def generate_backend_chunk(
@@ -630,29 +599,135 @@ def generate_backend_chunk(
             ref_text,
             design_instruction,
         )
-    if backend == "chatterbox":
-        return generate_chatterbox_chunk(
-            model,
-            task_mode,
-            chunk,
-            ref_audio_path,
-            ref_text,
-            speed,
-            temperature,
-        )
     raise ValueError(f"Unsupported backend: {backend}")
 
 
-def prepare_reference_audio(task_mode: str, ref_audio_path: Optional[str]) -> Optional[str]:
+def _read_prepared_attr(value, *names):
+    for name in names:
+        if isinstance(value, dict) and name in value:
+            return value[name]
+        if not isinstance(value, dict) and hasattr(value, name):
+            return getattr(value, name)
+    return None
+
+
+def coerce_prepared_reference(value, fallback_ref_text: Optional[str] = None) -> Optional[PreparedReference]:
+    if value is None:
+        return None
+    if isinstance(value, PreparedReference):
+        if value.clean_ref_text is None and fallback_ref_text:
+            value.clean_ref_text = fallback_ref_text
+        return value
+    if isinstance(value, (str, os.PathLike)):
+        return PreparedReference(
+            clean_audio_path=os.fspath(value),
+            clean_ref_text=fallback_ref_text,
+            audit={"ok": True, "source": "legacy-clean-path"},
+        )
+    if isinstance(value, tuple):
+        clean_audio = value[0] if len(value) > 0 else None
+        clean_text = value[1] if len(value) > 1 else fallback_ref_text
+        audit = value[2] if len(value) > 2 and isinstance(value[2], dict) else {}
+        quality_report = value[3] if len(value) > 3 else audit.get("quality_report_path")
+        if clean_audio:
+            return PreparedReference(
+                clean_audio_path=os.fspath(clean_audio),
+                clean_ref_text=(clean_text or fallback_ref_text),
+                quality_report_path=os.fspath(quality_report) if quality_report else None,
+                audit=audit,
+                source_audio_path=audit.get("source_path"),
+            )
+    clean_audio = _read_prepared_attr(value, "clean_audio_path", "audio_path", "clean_path", "path")
+    if clean_audio:
+        clean_text = _read_prepared_attr(value, "clean_ref_text", "ref_text", "text", "transcript")
+        quality_report = _read_prepared_attr(value, "quality_report_path", "report_path")
+        audit = _read_prepared_attr(value, "audit", "audit_info", "quality", "metadata") or {}
+        source_audio = _read_prepared_attr(value, "source_audio_path", "source_path")
+        return PreparedReference(
+            clean_audio_path=os.fspath(clean_audio),
+            clean_ref_text=(clean_text or fallback_ref_text),
+            quality_report_path=os.fspath(quality_report) if quality_report else None,
+            audit=audit if isinstance(audit, dict) else {"value": str(audit)},
+            source_audio_path=os.fspath(source_audio) if source_audio else None,
+        )
+    return None
+
+
+def _call_prepare_reference_pair(ref_audio_path: str, ref_text: Optional[str], output_dir: Path):
+    if _prepare_reference_pair is None:
+        return None
+    call_patterns = (
+        lambda: _prepare_reference_pair(ref_audio_path=ref_audio_path, ref_text=ref_text, output_dir=output_dir),
+        lambda: _prepare_reference_pair(ref_audio_path, ref_text, output_dir),
+        lambda: _prepare_reference_pair(ref_audio_path, ref_text),
+        lambda: _prepare_reference_pair(ref_audio_path, output_dir),
+    )
+    last_type_error = None
+    for call in call_patterns:
+        try:
+            return call()
+        except TypeError as exc:
+            last_type_error = exc
+            continue
+    if last_type_error is not None:
+        raise last_type_error
+    return None
+
+
+def prepare_reference_audio(
+    task_mode: str,
+    ref_audio_path: Optional[str],
+    ref_text: Optional[str] = None,
+) -> Optional[PreparedReference]:
     if task_mode != "clone" or not ref_audio_path:
         return None
-    return convert_audio_if_needed(ref_audio_path)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(tempfile.mkdtemp(prefix="reference_", dir=str(RUNTIME_DIR)))
+    try:
+        prepared = coerce_prepared_reference(
+            _call_prepare_reference_pair(ref_audio_path, ref_text, output_dir),
+            fallback_ref_text=ref_text,
+        )
+        if prepared is not None:
+            if not prepared.runtime_dir:
+                prepared.runtime_dir = str(output_dir)
+            return prepared
+
+        clean_path, quality_path, payload = prepare_reference_audio_clip(ref_audio_path, output_dir)
+        audit_payload = dict(payload)
+        if _audit_reference_audio is not None:
+            try:
+                audit_result = _audit_reference_audio(clean_path)
+                if isinstance(audit_result, dict):
+                    audit_payload.update({"audit_reference_audio": audit_result})
+            except TypeError:
+                audit_result = _audit_reference_audio(clean_path, ref_text)
+                if isinstance(audit_result, dict):
+                    audit_payload.update({"audit_reference_audio": audit_result})
+    except ReferenceAudioError as exc:
+        raise ReferenceAudioError(
+            f"{exc}; quality report: {output_dir / 'reference_quality.json'}"
+        ) from exc
+    return PreparedReference(
+        clean_audio_path=str(clean_path),
+        clean_ref_text=(ref_text or "").strip() or None,
+        quality_report_path=str(quality_path),
+        audit=audit_payload,
+        source_audio_path=str(ref_audio_path),
+        runtime_dir=str(output_dir),
+    )
 
 
-def cleanup_reference_audio(original_path: Optional[str], cleaned_path: Optional[str]):
+def cleanup_reference_audio(original_path: Optional[str], cleaned_path: Optional[str | PreparedReference]):
+    if isinstance(cleaned_path, PreparedReference):
+        cleaned_path = cleaned_path.clean_audio_path
     if cleaned_path and original_path and cleaned_path != original_path and os.path.exists(cleaned_path):
         try:
-            os.remove(cleaned_path)
+            clean_parent = Path(cleaned_path).parent
+            if clean_parent.parent == RUNTIME_DIR and clean_parent.name.startswith("reference_"):
+                shutil.rmtree(clean_parent)
+            else:
+                os.remove(cleaned_path)
         except OSError:
             pass
 
@@ -667,19 +742,21 @@ def benchmark_generate_case(
     custom_speaker: str = "Vivian",
     custom_instruction: str = "Normal tone",
     design_instruction: str = "calm podcast narrator with clear articulation",
-    speed: float = 1.05,
-    temperature: float = 0.85,
+    speed: float = 1.15,
+    temperature: float = 1.0,
     progress_callback: Optional[Callable[[str], None]] = None,
 ):
     from utils import split_text
 
     start = time.perf_counter()
-    model, _ = load_backend_model(backend, model_ref, task_mode=task_mode)
+    model, _ = load_backend_model(backend, model_ref)
     load_elapsed = time.perf_counter() - start
 
     chunks = split_text(text, max_chars=80)
     original_ref = ref_audio_path
-    clean_ref = prepare_reference_audio(task_mode, ref_audio_path)
+    prepared_ref = prepare_reference_audio(task_mode, ref_audio_path, ref_text)
+    clean_ref = prepared_ref.clean_audio_path if prepared_ref else None
+    clean_ref_text = prepared_ref.clean_ref_text if prepared_ref else ref_text
 
     audio_chunks = []
     sample_rate: Optional[int] = None
@@ -694,7 +771,7 @@ def benchmark_generate_case(
                 task_mode=task_mode,
                 chunk=chunk,
                 ref_audio_path=clean_ref,
-                ref_text=ref_text,
+                ref_text=clean_ref_text,
                 custom_speaker=custom_speaker,
                 custom_instruction=custom_instruction,
                 design_instruction=design_instruction,
@@ -709,7 +786,7 @@ def benchmark_generate_case(
                 )
             audio_chunks.append(result.audio)
     finally:
-        cleanup_reference_audio(original_ref, clean_ref)
+        cleanup_reference_audio(original_ref, prepared_ref)
 
     audio = np.concatenate(audio_chunks)
     generate_elapsed = time.perf_counter() - generate_start

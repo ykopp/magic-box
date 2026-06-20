@@ -2,9 +2,9 @@
 
 ## Stable Entrypoints
 
-- Web app: `streamlit run streamlit_app.py`
+- Web app: `.venv/bin/python -m streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8507`
 - CLI: `.venv/bin/python podcast_generator.py --help`
-- Version: `V1.5.6`
+- Version: `V2.2.0`
 
 旧 Gradio UI 和 PyInstaller 打包产物已下线。当前正式工作流只维护 Streamlit Web app 和 CLI。
 
@@ -13,19 +13,17 @@
 - Qwen 模型加载前会校验 `config.json`、`model.safetensors`、`speech_tokenizer/config.json`、`speech_tokenizer/model.safetensors`。缺少 speech tokenizer 权重会导致输出噪音，现在会直接报错并提示重新运行 `download_model.py`。
 - `download_model.py` 只保留当前稳定 voice clone 模型下载入口，并在下载后做同一套完整性校验。
 - 默认输出格式改为 MP3；`--format wav` 保留 WAV，`--format both` 同时保留 WAV 和 MP3。MP3 需要 `ffmpeg`。
-- 响度标准化从硬截断改为 peak limiter，目标 -16 LUFS 后按比例降峰到安全 ceiling，降低 clipping 风险。
+- 响度标准化使用 -23 LUFS + peak limiter，post-loudness de-click 只处理 >0.5 的硬跳变，避免过度修正常规语音瞬态。
 - 写入前后会做音频健康检查，提示空音频、低 RMS、低 peak、NaN/Inf、接近 clipping 等风险。
 - 后端输出会保留真实 sample rate，拼接时校验片段采样率一致，避免错误采样率写盘。
-- 新增 Qwen bf16 Base 模型注册，优先用于降低 8bit 量化带来的音质风险。
-- 新增 Chatterbox 实验后端，建议独立环境安装 `requirements-chatterbox.txt`。
 - 依赖升级：`mlx==0.31.2`、`mlx-audio==0.4.3`、`mlx-lm==0.31.3`、`mlx-metal==0.31.2`、`transformers==5.8.1`、`huggingface_hub==1.15.0`。
+- 模型加载前会检查当前 Python 环境的 `mlx-audio` 版本；低于 `0.4.3` 会直接报错，避免旧环境生成固定空洞/断续音频。
+- Qwen clone 的 `speed=1.00` 会按参考音频语速折算成实际模型 speed；真实折算值记录在 `quality_report.json` 的 `generation.model_speed`。
 
 ## Models
 
-- 推荐主线模型：`models/Qwen3-TTS-12Hz-1.7B-Base-bf16`
-- 轻量稳定 fallback：`models/Qwen3-TTS-12Hz-0.6B-Base-bf16`
-- 低内存 fallback：`models/Qwen3-TTS-12Hz-1.7B-Base-8bit`、`models/Qwen3-TTS-12Hz-0.6B-Base-8bit`
-- 实验后端：`chatterbox`，需要单独安装 `requirements-chatterbox.txt`
+- 主线模型：`Qwen3-TTS-12Hz-1.7B-Base-bf16` 或本机已下载的 `Qwen3-TTS-12Hz-1.7B-Base-8bit`
+- 轻量 fallback：`models/Qwen3-TTS-12Hz-0.6B-Base-8bit`
 - 实验后端：`voxcpm`，需要单独安装 `requirements-voxcpm.txt`
 
 不要把 `CustomVoice` 或 `VoiceDesign` 当作当前稳定主线；多人的声音切换通过 voice profile 的源音频完成。
@@ -44,13 +42,6 @@ speech_tokenizer/model.safetensors
 ```bash
 .venv/bin/python download_model.py 1
 ```
-
-`download_model.py` 编号：
-
-- `1`: 1.7B Base bf16
-- `2`: 0.6B Base bf16
-- `3`: 1.7B Base 8bit
-- `4`: 0.6B Base 8bit
 
 ## Voice Profiles
 
@@ -90,11 +81,12 @@ MP3 转换依赖 `ffmpeg`。
 ## Generated Files
 
 `outputs/`、`runtime/`、日志、cache、build/dist 都是可再生数据或本机状态。
-清理项目时可以删除它们，但保留：
+清理项目时可以删除它们。个人声音素材默认不提交 Git；清理本机目录时保留正在使用的 Profile。
 
 - `outputs/.gitkeep`
 - `voices/.gitkeep`
 - `voices/profiles/.gitkeep`
+- `voices/profiles/<active-profile>/`
 - `audio_samples/.gitkeep`
 - `models/`
 - `.venv/`
@@ -102,6 +94,6 @@ MP3 转换依赖 `ffmpeg`。
 ## Verification
 
 ```bash
-.venv/bin/python -m py_compile streamlit_app.py voice_profiles.py voice_controls.py article_extractor.py podcast_generator.py
-.venv/bin/python -m unittest discover -s tests
+.venv/bin/python -m py_compile streamlit_app.py voice_profiles.py voice_controls.py article_extractor.py podcast_generator.py tts_backends.py model_manager.py utils.py
+.venv/bin/python -m pytest -q
 ```

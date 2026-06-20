@@ -1,4 +1,6 @@
 import json
+import logging
+import re
 import shutil
 import subprocess
 import time
@@ -6,10 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+_log = logging.getLogger(__name__)
+
 MODELS_DIR_NAME = "podcast_generator_models"
 UPDATE_CACHE_HOURS = 12
 DEFAULT_AUTO_UPDATE = False
-APP_DIR = Path(__file__).resolve().parent
 TASK_FALLBACK_CHAIN = {
     "clone": ["clone"],
     "custom": ["custom", "clone"],
@@ -17,24 +20,6 @@ TASK_FALLBACK_CHAIN = {
 }
 
 HUGGINGFACE_MODELS = {
-    "Qwen3-TTS-12Hz-1.7B-Base-bf16": {
-        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
-        "size_gb": 4.54,
-        "description": "bf16 基础模型 (1.7B) - 更少量化损失，优先用于高质量 voice cloning",
-        "recommended": True,
-        "quality_score": 100,
-        "speed_score": 55,
-        "task": "clone",
-    },
-    "Qwen3-TTS-12Hz-0.6B-Base-bf16": {
-        "repo_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
-        "size_gb": 2.51,
-        "description": "bf16 基础模型 (0.6B) - 轻量稳定的 voice cloning 备选",
-        "recommended": True,
-        "quality_score": 82,
-        "speed_score": 90,
-        "task": "clone",
-    },
     "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit": {
         "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
         "size_gb": 3.08,
@@ -80,6 +65,80 @@ HUGGINGFACE_MODELS = {
         "speed_score": 62,
         "task": "clone",
     },
+    # --- bf16 variants (best quality, larger) ---
+    "Qwen3-TTS-12Hz-1.7B-Base-bf16": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+        "size_gb": 5.8,
+        "description": "Base 大模型 bf16 - 最高音质，推荐录音级场景",
+        "recommended": False,
+        "quality_score": 100,
+        "speed_score": 50,
+        "task": "clone",
+    },
+    "Qwen3-TTS-12Hz-0.6B-Base-bf16": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
+        "size_gb": 3.8,
+        "description": "Base 小模型 bf16 - 高音质 + 更快速度",
+        "recommended": False,
+        "quality_score": 82,
+        "speed_score": 80,
+        "task": "clone",
+    },
+    "Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16",
+        "size_gb": 5.8,
+        "description": "CustomVoice 大模型 bf16 - 最高品质风格控制",
+        "recommended": False,
+        "quality_score": 100,
+        "speed_score": 50,
+        "task": "custom",
+    },
+    "Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
+        "size_gb": 3.8,
+        "description": "CustomVoice 小模型 bf16 - 快速高质量预置声音",
+        "recommended": False,
+        "quality_score": 85,
+        "speed_score": 80,
+        "task": "custom",
+    },
+    "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16": {
+        "repo_id": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
+        "size_gb": 5.8,
+        "description": "VoiceDesign bf16 - 文字描述创造声音的最高品质",
+        "recommended": False,
+        "quality_score": 100,
+        "speed_score": 50,
+        "task": "design",
+    },
+    # --- VoxCPM2 MLX quantized variants ---
+    "VoxCPM2-8bit": {
+        "repo_id": "mlx-community/VoxCPM2-8bit",
+        "size_gb": 2.2,
+        "description": "VoxCPM2 MLX 8-bit — 推荐，质量/速度平衡",
+        "recommended": True,
+        "quality_score": 92,
+        "speed_score": 70,
+        "task": "clone",
+    },
+    "VoxCPM2-bf16": {
+        "repo_id": "mlx-community/VoxCPM2-bf16",
+        "size_gb": 3.8,
+        "description": "VoxCPM2 MLX bf16 — 最高音质 48kHz",
+        "recommended": False,
+        "quality_score": 95,
+        "speed_score": 55,
+        "task": "clone",
+    },
+    "VoxCPM2-4bit": {
+        "repo_id": "mlx-community/VoxCPM2-4bit",
+        "size_gb": 1.88,
+        "description": "VoxCPM2 MLX 4-bit — 最快，62% 更小",
+        "recommended": False,
+        "quality_score": 85,
+        "speed_score": 90,
+        "task": "clone",
+    },
 }
 
 
@@ -116,14 +175,20 @@ def get_models_dir() -> Path:
     try:
         models_dir.mkdir(parents=True, exist_ok=True)
         return models_dir
-    except PermissionError:
-        project_models = get_project_models_dir()
+    except (PermissionError, OSError) as exc:
+        project_models = Path.cwd() / "models"
         project_models.mkdir(parents=True, exist_ok=True)
+        _log.warning(
+            "无法使用 $HOME/%s (%s)；回退到 %s。模型会下载到项目目录，注意加入 .gitignore。",
+            MODELS_DIR_NAME,
+            exc,
+            project_models,
+        )
         return project_models
 
 
 def get_project_models_dir() -> Path:
-    return APP_DIR / "models"
+    return Path.cwd() / "models"
 
 
 def get_config_file() -> Path:
@@ -133,8 +198,15 @@ def get_config_file() -> Path:
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir / "config.json"
-    except PermissionError:
-        return APP_DIR / "podcast_config.json"
+    except (PermissionError, OSError) as exc:
+        fallback = Path.cwd() / "podcast_config.json"
+        _log.warning(
+            "无法写入 $HOME/%s (%s)；回退到 %s",
+            ".podcast_generator",
+            exc,
+            fallback,
+        )
+        return fallback
 
 
 MODELS_DIR = get_models_dir()
@@ -202,31 +274,24 @@ class ModelManager:
         ]
         return all((model_path / f).exists() for f in required_files)
 
-    def _read_tts_model_type(self, model_path: Path) -> Optional[str]:
-        try:
-            config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        if not isinstance(config, dict):
-            return None
-        model_type = config.get("tts_model_type", "base")
-        return str(model_type).strip().lower() if model_type is not None else None
-
-    def _is_clone_model_valid(self, model_path: Path) -> bool:
-        return self._is_model_valid(model_path) and self._read_tts_model_type(model_path) == "base"
-
-    def _is_valid_for_registry_task(self, model_name: str, model_path: Path) -> bool:
-        if HUGGINGFACE_MODELS.get(model_name, {}).get("task") == "clone":
-            return self._is_clone_model_valid(model_path)
-        return self._is_model_valid(model_path)
-
     def _read_local_revision_from_cache(self, model_path: Optional[Path]) -> Optional[str]:
+        """Best-effort local revision discovery.
+
+        Looks for the revision (sha) recorded in the snapshot download metadata
+        that ``huggingface_hub`` writes.  Returns ``None`` when the metadata
+        file is missing or unreadable; callers should treat that as "no
+        fingerprint available" rather than "no model".
+        """
         if not model_path:
             return None
 
+        # The standard HF download metadata lives at:
+        #   <model_path>/.cache/huggingface/download/<file>.metadata
+        # The first non-empty line is the etag / sha.
         candidates = [
             model_path / ".cache" / "huggingface" / "download" / "config.json.metadata",
             model_path / ".cache" / "huggingface" / "download" / "model.safetensors.metadata",
+            model_path / ".cache" / "huggingface" / "download" / "model.safetensors.index.json.metadata",
         ]
         for metadata_file in candidates:
             if not metadata_file.exists():
@@ -235,8 +300,20 @@ class ModelManager:
                 first_line = metadata_file.read_text(encoding="utf-8").splitlines()[0].strip()
                 if first_line:
                     return first_line
-            except Exception:
+            except (OSError, UnicodeDecodeError):
                 continue
+
+        # Fallback: ``snapshot_download`` with ``local_dir_use_symlinks=False``
+        # may also drop a refs file inside the snapshot directory.  We do not
+        # assume a particular layout, so this branch is best-effort.
+        refs_file = model_path / "refs" / "main"
+        if refs_file.exists():
+            try:
+                sha = refs_file.read_text(encoding="utf-8").strip()
+                if sha:
+                    return sha
+            except (OSError, UnicodeDecodeError):
+                pass
 
         return None
 
@@ -264,11 +341,11 @@ class ModelManager:
 
     def _resolve_model_location(self, model_name: str) -> Tuple[Optional[Path], str]:
         user_path = self.models_dir / model_name
-        if user_path.exists() and self._is_valid_for_registry_task(model_name, user_path):
+        if user_path.exists() and self._is_model_valid(user_path):
             return user_path, "user"
 
         project_path = self.project_models_dir / model_name
-        if project_path.exists() and self._is_valid_for_registry_task(model_name, project_path):
+        if project_path.exists() and self._is_model_valid(project_path):
             return project_path, "project"
 
         return None, "none"
@@ -555,9 +632,8 @@ class ModelManager:
                     break
                 if line and progress_callback:
                     # Try to parse a percentage from e.g. "  45%|..." output
-                    import re as _re
-                    m = _re.search(r"(\d+)%", line)
-                    pct = float(m.group(1)) / 100.0 if m else 0.5
+                    m = re.search(r"(\d+)%", line)
+                    pct = float(m.group(1)) / 100.0 if m else None
                     progress_callback(pct, line.strip())
 
             if process.returncode != 0:

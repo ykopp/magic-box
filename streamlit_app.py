@@ -1,29 +1,48 @@
+import hashlib
+import importlib
+import json
+import logging
+import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+if __name__ == "__main__" and get_script_run_ctx(suppress_warning=True) is None:
+    os.execv(
+        sys.executable,
+        [sys.executable, "-m", "streamlit", "run", str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
 
 from article_extractor import extract_article_from_url
 from podcast_generator import generate_podcast
-from tts_backends import (
-    get_backend_model_cache_token,
-    get_backend_model_choices,
-    get_default_model_ref,
-    load_backend_model,
-)
-from utils import _safe_remove, make_output_filename, split_text
+from tts_backends import get_backend_model_choices, get_default_model_ref, load_backend_model
+from utils import ReferenceAudioError, make_output_filename, safe_remove, split_text
 from voice_controls import get_preset, optimize_podcast_rhythm, preset_names
 from voice_profiles import delete_profile, list_profiles, save_profile, slugify_profile_id, text_fingerprint
+
+# Configure logging once; guard against Streamlit bare-mode module reloads.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
 
 
 APP_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = APP_DIR / "outputs"
 RUNTIME_DIR = APP_DIR / "runtime" / "streamlit"
 MAX_PREVIEW_CHUNKS = 8
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_RUNTIME_BYTES = 500 * 1024 * 1024  # 500 MB of kept uploads
 PROFILE_AUDIO_TYPES = ["wav", "mp3", "m4a", "aac", "flac", "ogg"]
+REFERENCE_RETRY_PROMPT = "请重新提供 3-20 秒干净单人声，并填写逐字匹配文本。"
 
 
 st.set_page_config(
@@ -33,9 +52,16 @@ st.set_page_config(
 )
 
 
-st.markdown(
-    """
-    <style>
+_CSS_PATH = APP_DIR / "app_styles.css"
+if _CSS_PATH.exists():
+    st.markdown(
+        f"<style>{_CSS_PATH.read_text(encoding='utf-8')}</style>",
+        unsafe_allow_html=True,
+    )
+else:  # pragma: no cover - safety net for frozen bundles
+    st.markdown(
+        """
+        <style>
     :root {
         --bg: #08090b;
         --panel: #111318;
@@ -316,8 +342,8 @@ st.markdown(
     }
     </style>
     """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
 
 def _ensure_dirs() -> None:
@@ -332,14 +358,56 @@ def _safe_filename(name: str, fallback: str) -> str:
     return stem or fallback
 
 
+def _enforce_runtime_quota() -> None:
+    """Remove oldest uploads in ``RUNTIME_DIR`` when total size exceeds quota."""
+    if not RUNTIME_DIR.exists():
+        return
+    files = [path for path in RUNTIME_DIR.iterdir() if path.is_file()]
+    total = sum(path.stat().st_size for path in files)
+    if total <= MAX_RUNTIME_BYTES:
+        return
+
+    files.sort(key=lambda path: path.stat().st_mtime)
+    for path in files:
+        if total <= MAX_RUNTIME_BYTES:
+            break
+        try:
+            total -= path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+
+
 def _persist_upload(uploaded_file, prefix: str) -> Optional[Path]:
     if uploaded_file is None:
         return None
+    if uploaded_file.size > MAX_UPLOAD_BYTES:
+        st.error(f"文件过大（{uploaded_file.size / 1024 / 1024:.0f} MB），上限为 50 MB。")
+        return None
     _ensure_dirs()
+    _enforce_runtime_quota()
     filename = _safe_filename(uploaded_file.name, f"{prefix}.bin")
     target = RUNTIME_DIR / f"{prefix}_{uuid4().hex}_{filename}"
     target.write_bytes(uploaded_file.getbuffer())
     return target
+
+
+def _persist_upload_once(uploaded_file, prefix: str, state_key: str) -> Optional[Path]:
+    if uploaded_file is None:
+        st.session_state.pop(state_key, None)
+        return None
+    raw_bytes = uploaded_file.getvalue()
+    upload_id = f"{uploaded_file.name}:{uploaded_file.size}:{hashlib.md5(raw_bytes).hexdigest()}"
+    cached = st.session_state.get(state_key)
+    if isinstance(cached, dict) and cached.get("upload_id") == upload_id and cached.get("path"):
+        cached_path = Path(cached["path"])
+        if cached_path.exists():
+            return cached_path
+
+    path = _persist_upload(uploaded_file, prefix)
+    if path is not None:
+        st.session_state[state_key] = {"upload_id": upload_id, "path": str(path)}
+    return path
 
 
 def _read_uploaded_text(uploaded_file) -> str:
@@ -413,9 +481,17 @@ def _get_default_choice_index(choices: list, backend: str) -> int:
 
 
 @st.cache_resource(show_spinner=False)
-def _load_model_cached(backend: str, model_ref: str, cache_token: str = ""):
-    model, resolved_ref = load_backend_model(backend, model_ref, task_mode="clone")
+def _load_model_cached(backend: str, model_ref: str):
+    model, resolved_ref = load_backend_model(backend, model_ref)
     return model, resolved_ref
+
+
+def _maybe_clear_cached_model(backend: str) -> None:
+    """Drop any cached model whose backend differs from *backend*."""
+    previous = st.session_state.get("_cached_model_backend")
+    if previous is not None and previous != backend:
+        _load_model_cached.clear()
+    st.session_state["_cached_model_backend"] = backend
 
 
 def _recent_outputs(limit: int = 10) -> list[Path]:
@@ -431,6 +507,212 @@ def _recent_outputs(limit: int = 10) -> list[Path]:
 
 def _download_bytes(path: Path) -> bytes:
     return path.read_bytes()
+
+
+def _quality_report_candidates(final_path: Path, requested_output_path: Path) -> list[Path]:
+    """Return likely quality-report locations in priority order."""
+
+    candidates = [
+        final_path.parent / "quality_report.json",
+        requested_output_path.parent / "quality_report.json",
+        final_path.with_suffix(".quality_report.json"),
+        requested_output_path.with_suffix(".quality_report.json"),
+        final_path.with_name(f"{final_path.stem}_quality_report.json"),
+        requested_output_path.with_name(f"{requested_output_path.stem}_quality_report.json"),
+    ]
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            unique.append(candidate)
+            seen.add(resolved)
+    return unique
+
+
+def _load_quality_report(final_path: Path, requested_output_path: Path) -> tuple[Path | None, dict[str, Any] | None]:
+    for candidate in _quality_report_candidates(final_path, requested_output_path):
+        if not candidate.exists():
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return candidate, None
+        if isinstance(data, dict):
+            return candidate, data
+        return candidate, None
+    return None, None
+
+
+def _quality_report_summary(report: dict[str, Any]) -> dict[str, Any]:
+    summary = report.get("summary")
+    if isinstance(summary, dict):
+        source = summary
+    else:
+        source = report
+    chunks = report.get("chunks")
+    chunk_reports = chunks if isinstance(chunks, list) else []
+    failed_chunk_count = sum(
+        1
+        for chunk in chunk_reports
+        if isinstance(chunk, dict) and bool(chunk.get("issues") or chunk.get("errors") or chunk.get("warnings"))
+    )
+
+    return {
+        "total_segments": source.get("total_segments")
+        or source.get("segment_count")
+        or source.get("total")
+        or source.get("chunks_total")
+        or (len(chunk_reports) if chunk_reports else None),
+        "passed_segments": source.get("passed_segments")
+        or source.get("ok_segments")
+        or source.get("passed")
+        or source.get("chunks_passed")
+        or (len(chunk_reports) - failed_chunk_count if chunk_reports else None),
+        "failed_segments": source.get("failed_segments_count")
+        or source.get("failed_count")
+        or source.get("chunks_failed")
+        or (failed_chunk_count if chunk_reports else None),
+        "status": source.get("status") or report.get("status"),
+    }
+
+
+def _quality_report_failed_segments(report: dict[str, Any]) -> list[int]:
+    explicit_segments = report.get("failed_segments")
+    if isinstance(explicit_segments, list):
+        return sorted(
+            {number for item in explicit_segments if (number := _coerce_segment_number(item)) is not None}
+        )
+
+    explicit_indices = report.get("failed_segment_indices") or report.get("failed_indices")
+    if isinstance(explicit_indices, list):
+        return sorted(
+            {number for item in explicit_indices if (number := _coerce_segment_number(item, zero_based=True)) is not None}
+        )
+
+    failed: set[int] = set()
+    segments = report.get("segments") or report.get("segment_reports") or report.get("chunks")
+    if isinstance(segments, list):
+        for index, segment in enumerate(segments, start=1):
+            if not isinstance(segment, dict):
+                continue
+            status = str(segment.get("status") or segment.get("result") or "").lower()
+            passed = segment.get("passed")
+            warnings = segment.get("warnings") or segment.get("errors") or segment.get("issues")
+            if status in {"failed", "fail", "error"} or passed is False or warnings:
+                segment_number = (
+                    _coerce_segment_number(segment.get("segment"))
+                    or _coerce_segment_number(segment.get("segment_index"), zero_based=True)
+                    or _coerce_segment_number(segment.get("index"), zero_based=True)
+                    or index
+                )
+                failed.add(segment_number)
+    return sorted(failed)
+
+
+def _quality_report_issue_lines(report: dict[str, Any], limit: int = 5) -> list[str]:
+    issues = report.get("issues")
+    lines: list[str] = []
+    if isinstance(issues, list):
+        lines.extend(str(issue) for issue in issues if str(issue).strip())
+
+    final = report.get("final")
+    if isinstance(final, dict):
+        for key in (
+            "output_diagnostics",
+            "written_wav_diagnostics",
+            "decoded_mp3_diagnostics",
+            "output_warnings",
+            "written_wav_warnings",
+            "decoded_mp3_warnings",
+        ):
+            values = final.get(key)
+            if isinstance(values, list):
+                lines.extend(str(value) for value in values if str(value).strip())
+
+    deduped = list(dict.fromkeys(lines))
+    return deduped[:limit]
+
+
+def _coerce_segment_number(value: Any, *, zero_based: bool = False) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value + 1 if zero_based else value
+    if isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+        return number + 1 if zero_based else number
+    return None
+
+
+def _segments_dir_from_report(report: dict[str, Any] | None, final_path: Path, requested_output_path: Path) -> Path:
+    if report:
+        for key in ("segments_dir", "segments_folder", "segment_dir", "segment_folder"):
+            raw_path = report.get(key)
+            if isinstance(raw_path, str) and raw_path.strip():
+                path = Path(raw_path).expanduser()
+                return path if path.is_absolute() else final_path.parent / path
+    return requested_output_path.parent / f".{requested_output_path.stem}_segments"
+
+
+def _show_quality_report(final_path: Path, requested_output_path: Path) -> None:
+    report_path, report = _load_quality_report(final_path, requested_output_path)
+    segments_dir = _segments_dir_from_report(report, final_path, requested_output_path)
+
+    st.subheader("质量报告")
+    if report_path is None:
+        st.info("未找到 quality_report.json；生成器可能未写出质量报告。")
+    elif report is None:
+        st.warning(f"质量报告无法解析: {report_path.relative_to(APP_DIR) if report_path.is_relative_to(APP_DIR) else report_path}")
+    else:
+        summary = _quality_report_summary(report)
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("总段数", summary["total_segments"] or "-")
+        summary_cols[1].metric("通过段", summary["passed_segments"] or "-")
+        summary_cols[2].metric("失败段", summary["failed_segments"] or len(_quality_report_failed_segments(report)) or 0)
+        summary_cols[3].metric("状态", summary["status"] or "-")
+
+        failed_segments = _quality_report_failed_segments(report)
+        if failed_segments:
+            st.error("失败段编号: " + ", ".join(str(index) for index in failed_segments))
+        else:
+            st.success("质量报告未标记失败段。")
+        issue_lines = _quality_report_issue_lines(report)
+        if issue_lines:
+            st.warning("质量诊断: " + "；".join(issue_lines))
+        st.markdown(
+            f'<span class="file-path">报告: {report_path.relative_to(APP_DIR) if report_path.is_relative_to(APP_DIR) else report_path}</span>',
+            unsafe_allow_html=True,
+        )
+
+    if segments_dir.exists():
+        segment_count = len([path for path in segments_dir.iterdir() if path.is_file()])
+        st.markdown(
+            f'<span class="file-path">segments 文件夹: {segments_dir.relative_to(APP_DIR) if segments_dir.is_relative_to(APP_DIR) else segments_dir} ({segment_count} 个文件)</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(f"segments 文件夹未找到: {segments_dir}")
+
+
+def _has_quality_artifacts(final_path: Path, requested_output_path: Path) -> bool:
+    report_path, report = _load_quality_report(final_path, requested_output_path)
+    segments_dir = _segments_dir_from_report(report, final_path, requested_output_path)
+    return report_path is not None or segments_dir.exists()
+
+
+def _generation_failure_message(final_path: Path, requested_output_path: Path) -> str:
+    report_path, report = _load_quality_report(final_path, requested_output_path)
+    if not report:
+        return "生成器未返回输出路径，且未找到可解析的质量报告。"
+    issues = _quality_report_issue_lines(report, limit=3)
+    if issues:
+        return "生成器未返回输出路径: " + "；".join(issues)
+    status = report.get("status") or "unknown"
+    if report_path is not None:
+        path_label = report_path.relative_to(APP_DIR) if report_path.is_relative_to(APP_DIR) else report_path
+        return f"生成器未返回输出路径，质量报告状态为 {status}: {path_label}"
+    return f"生成器未返回输出路径，质量报告状态为 {status}。"
 
 
 def _estimate_duration_label(characters: int) -> str:
@@ -494,10 +776,269 @@ def _format_profile(profile) -> str:
     return f"{profile.display_name} ({source}{suffix})"
 
 
+def _profile_ref_text_key(profile_id: str) -> str:
+    return f"voice_profile_ref_text_{profile_id}"
+
+
+def _profile_has_saved_reference(profile: Any) -> bool:
+    return bool(
+        profile is not None
+        and not getattr(profile, "built_in", False)
+        and getattr(profile, "can_generate", False)
+        and str(getattr(profile, "ref_text", "") or "").strip()
+    )
+
+
+def _as_text_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)]
+
+
+def _profile_root(profile: Any) -> Path | None:
+    ref_audio_path = getattr(profile, "ref_audio_path", None)
+    if ref_audio_path is None:
+        return None
+    return Path(ref_audio_path).parent
+
+
+def _read_profile_metadata(profile: Any) -> dict[str, Any]:
+    root = _profile_root(profile)
+    if root is None:
+        return {}
+    metadata_path = root / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _is_legacy_profile(profile: Any) -> bool:
+    if profile is None:
+        return False
+    root = _profile_root(profile)
+    if root is None:
+        return True
+
+    metadata = _read_profile_metadata(profile)
+    schema = metadata.get("schema_version") or metadata.get("profile_schema_version")
+    if str(schema).strip().lower() in {"1", "1.0", "v1"}:
+        return True
+
+    clean_audio = root / "reference_clean.wav"
+    clean_text = root / "reference_clean.txt"
+    return not (clean_audio.exists() and clean_text.exists())
+
+
+def _normalise_reference_quality_report(raw_report: Any) -> dict[str, Any]:
+    report = raw_report if isinstance(raw_report, dict) else {}
+    status = str(report.get("status") or "").strip().lower()
+    passed = report.get("passed")
+    if passed is None:
+        passed = report.get("ok")
+    if passed is None and status:
+        passed = status in {"pass", "passed", "ok", "success"}
+    passed = bool(passed)
+
+    metrics_source = report.get("metrics") if isinstance(report.get("metrics"), dict) else report
+    metric_keys = (
+        "duration_seconds",
+        "sample_rate",
+        "rms",
+        "peak",
+        "clipped_ratio",
+        "active_ratio",
+        "snr_db",
+        "noise_floor_db",
+    )
+    metrics = {key: metrics_source[key] for key in metric_keys if key in metrics_source}
+    issues = (
+        _as_text_list(report.get("issues"))
+        + _as_text_list(report.get("errors"))
+        + _as_text_list(report.get("warnings"))
+        + _as_text_list(report.get("reason"))
+        + _as_text_list(report.get("rejection_reason"))
+    )
+    recommendations = _as_text_list(report.get("recommendations"))
+    if not passed and not recommendations:
+        recommendations = [REFERENCE_RETRY_PROMPT]
+
+    return {
+        "status": "passed" if passed else (status or "failed"),
+        "passed": passed,
+        "metrics": metrics,
+        "issues": issues,
+        "recommendations": recommendations,
+        "raw": report,
+    }
+
+
+def _load_profile_reference_report(profile: Any) -> dict[str, Any] | None:
+    root = _profile_root(profile)
+    if root is None:
+        return None
+    for path in (root / "reference_quality.json", root / "reference_audit.json"):
+        if not path.exists():
+            continue
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(report, dict):
+            return report
+    return None
+
+
+def _call_optional_reference_audit(audio_path: Path, ref_text: str, profile: Any = None) -> dict[str, Any] | None:
+    candidates = (
+        ("voice_profiles", "audit_profile_reference"),
+        ("voice_profiles", "audit_reference_profile"),
+        ("utils", "audit_reference_audio"),
+        ("utils", "audit_reference_audio_file"),
+        ("utils", "validate_reference_audio_file"),
+        ("utils", "audit_reference_audio_quality"),
+    )
+    for module_name, function_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        audit_func = getattr(module, function_name, None)
+        if audit_func is None:
+            continue
+        call_attempts = []
+        if profile is not None:
+            call_attempts.extend(
+                [
+                    lambda: audit_func(profile=profile, ref_text=ref_text, app_dir=APP_DIR),
+                    lambda: audit_func(profile, ref_text),
+                ]
+            )
+        call_attempts.extend(
+            [
+                lambda: audit_func(audio_path=audio_path, ref_text=ref_text),
+                lambda: audit_func(str(audio_path), ref_text),
+                lambda: audit_func(audio_path),
+            ]
+        )
+        for attempt in call_attempts:
+            try:
+                result = attempt()
+            except TypeError:
+                continue
+            except Exception as exc:
+                return {"ok": False, "status": "failed", "issues": [str(exc)], "recommendations": [REFERENCE_RETRY_PROMPT]}
+            if isinstance(result, tuple) and result:
+                result = result[-1]
+            if isinstance(result, dict):
+                return result
+    return None
+
+
+def _reference_quality_status(
+    *,
+    ref_audio_path: Path | None,
+    ref_text: str,
+    profile: Any = None,
+    profile_mode: str = "",
+) -> dict[str, Any]:
+    if profile is not None and _is_legacy_profile(profile):
+        return _normalise_reference_quality_report(
+            {
+                "ok": False,
+                "status": "failed",
+                "issues": ["旧 Profile 缺少 reference_clean.wav / reference_clean.txt，或仍是 schema v1。"],
+                "recommendations": ["请在“管理声音 Profile”中用干净单人声重新保存这个 Profile。", REFERENCE_RETRY_PROMPT],
+            }
+        )
+    if not ref_text.strip():
+        return _normalise_reference_quality_report(
+            {
+                "ok": False,
+                "status": "failed",
+                "issues": ["参考文本缺失。"],
+                "recommendations": [REFERENCE_RETRY_PROMPT],
+            }
+        )
+    if ref_audio_path is None:
+        label = "请上传临时源声音。" if profile_mode == "临时上传源声音" else "请选择可用 Profile。"
+        return _normalise_reference_quality_report(
+            {"ok": False, "status": "missing", "issues": [label], "recommendations": [REFERENCE_RETRY_PROMPT]}
+        )
+    if not ref_audio_path.exists():
+        return _normalise_reference_quality_report(
+            {
+                "ok": False,
+                "status": "failed",
+                "issues": ["参考音频文件不存在。"],
+                "recommendations": [REFERENCE_RETRY_PROMPT],
+            }
+        )
+
+    profile_report = _load_profile_reference_report(profile) if profile is not None else None
+    if profile_report is not None:
+        return _normalise_reference_quality_report(profile_report)
+
+    audit_report = _call_optional_reference_audit(ref_audio_path, ref_text, profile=profile)
+    if audit_report is not None:
+        return _normalise_reference_quality_report(audit_report)
+
+    return _normalise_reference_quality_report(
+        {
+            "ok": False,
+            "status": "pending",
+            "issues": ["参考音频还没有可用审核结果。"],
+            "recommendations": [REFERENCE_RETRY_PROMPT],
+        }
+    )
+
+
+def _can_generate_with_reference_quality(status: dict[str, Any]) -> bool:
+    return bool(status.get("passed"))
+
+
+def _show_reference_quality_card(status: dict[str, Any]) -> None:
+    passed = _can_generate_with_reference_quality(status)
+    st.subheader("参考音频质量")
+    if passed:
+        st.success("通过：参考音频可用于克隆。")
+    else:
+        st.error("失败：参考音频暂不可用于生成。")
+
+    metrics = status.get("metrics") if isinstance(status.get("metrics"), dict) else {}
+    if metrics:
+        metric_items = list(metrics.items())[:4]
+        cols = st.columns(len(metric_items))
+        for col, (key, value) in zip(cols, metric_items):
+            col.metric(key, value)
+    else:
+        st.caption("暂无可展示的审核指标。")
+
+    issues = _as_text_list(status.get("issues"))
+    recommendations = _as_text_list(status.get("recommendations"))
+    if issues:
+        st.markdown("**Issues**")
+        for item in issues:
+            st.write(f"- {item}")
+    if recommendations:
+        st.markdown("**Recommendations**")
+        for item in recommendations:
+            st.write(f"- {item}")
+
+
 def _sync_uploaded_text(uploaded_file) -> None:
     if uploaded_file is None:
         return
-    upload_id = f"{uploaded_file.name}:{uploaded_file.size}"
+    # Use content hash instead of name:size to detect genuinely changed uploads
+    raw_bytes = uploaded_file.getvalue()
+    upload_id = f"{uploaded_file.name}:{hashlib.md5(raw_bytes).hexdigest()}"
     if st.session_state.get("last_text_upload_id") == upload_id:
         return
     persisted_path = _persist_upload(uploaded_file, "script_text")
@@ -519,7 +1060,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("制作参数")
-        backend = st.selectbox("TTS 后端", ["qwen", "chatterbox", "voxcpm"], index=0)
+        backend = st.selectbox("TTS 后端", ["qwen", "voxcpm"], index=0)
         model_choices = _filter_model_choices_for_clone(backend, get_backend_model_choices(backend))
 
         if model_choices:
@@ -556,24 +1097,34 @@ def main() -> None:
                 max_value=2.00,
                 step=0.05,
                 key="voice_speed",
-                help="控制整体朗读速度，数值越高越快。",
+                help="控制相对参考音频的朗读速度。Qwen clone 下 1.00 会先按参考音频语速折算成模型 speed；过高更容易吞字、断裂或音色漂移。",
             )
+            if backend == "qwen" and speed > 1.05:
+                st.warning("Qwen clone 语速高于 1.05 时坏段风险会上升。")
             temperature = st.slider(
                 "表达随机性",
                 min_value=0.10,
                 max_value=2.00,
                 step=0.05,
                 key="voice_temperature",
-                help="控制声音表现的变化幅度，过高可能更不稳定。",
+                help="控制声音表现的变化幅度。Qwen clone 建议不超过 0.85，过高更容易出现杂音、跑调或不稳定段。",
+            )
+            if backend == "qwen" and temperature > 0.85:
+                st.warning("Qwen clone 表达随机性高于 0.85 时音质不稳定风险会上升。")
+            st.session_state["voice_chunk_max_chars"] = min(
+                600,
+                max(80, int(st.session_state.get("voice_chunk_max_chars", preset.chunk_max_chars))),
             )
             chunk_max_chars = st.slider(
                 "单段字符上限",
-                min_value=40,
-                max_value=140,
-                step=5,
+                min_value=80,
+                max_value=600,
+                step=20,
                 key="voice_chunk_max_chars",
-                help="控制切分粒度，短段更稳，长段更连贯。",
+                help="控制切分粒度。短文建议 400-600 保持连贯；长文可调低方便定位坏段。",
             )
+            if backend == "qwen" and chunk_max_chars < 200:
+                st.warning("单段字符上限过低会频繁重新起声，短文容易听起来断断续续。")
 
         normalise = st.toggle("响度标准化", value=True)
         resume = st.toggle(
@@ -601,9 +1152,7 @@ def main() -> None:
         }[output_format_label]
 
         if backend == "voxcpm":
-            st.info("VoxCPM 仍是实验后端；语速和表达随机性可能会被后端忽略。")
-        elif backend == "chatterbox":
-            st.info("Chatterbox 仍是实验后端；请在独立环境安装 chatterbox-tts 后再用于长文生成。")
+            st.info("VoxCPM2 MLX: 48kHz 高保真, 30 语言, Voice Design + Clone。语速/表达随机性将被忽略。")
 
     target_text_for_header = st.session_state.get("target_text", "").strip()
     header_chunks = split_text(target_text_for_header, max_chars=chunk_max_chars) if target_text_for_header else []
@@ -730,15 +1279,38 @@ def main() -> None:
                 st.rerun()
 
             ref_audio_path = selected_profile.ref_audio_path
-            ref_text = st.text_area(
-                "参考音频文本",
-                value=selected_profile.ref_text,
-                height=140,
-                help="必须与源声音里实际朗读的文字一致；缺失时不能生成。",
-            ).strip()
+            ref_text_key = _profile_ref_text_key(selected_profile.id)
+            saved_ref_text = (selected_profile.ref_text or "").strip()
+            if saved_ref_text and not str(st.session_state.get(ref_text_key, "")).strip():
+                st.session_state[ref_text_key] = saved_ref_text
+
+            if _profile_has_saved_reference(selected_profile):
+                ref_text = saved_ref_text
+                st.success("已使用 Profile 中保存的参考文本；本次生成不需要重新上传或填写。")
+                with st.expander("查看 / 临时覆盖参考文本", expanded=False):
+                    override_ref_text = st.text_area(
+                        "参考音频文本",
+                        key=ref_text_key,
+                        height=140,
+                        help="默认使用 Profile 保存的文本。只有在你明确修改这里时，本次生成才会临时覆盖；不会改写 Profile。",
+                    ).strip()
+                    if override_ref_text and override_ref_text != saved_ref_text:
+                        ref_text = override_ref_text
+                        st.warning("本次生成使用临时覆盖文本；Profile 本身不会被修改。")
+                    elif not override_ref_text:
+                        st.warning("覆盖文本为空，已继续使用 Profile 保存的参考文本。")
+            else:
+                ref_text = st.text_area(
+                    "参考音频文本",
+                    key=ref_text_key,
+                    height=140,
+                    help="必须与源声音里实际朗读的文字一致；缺失时不能生成。",
+                ).strip()
             profile_metadata = {
-                "voice_profile_id": selected_profile.id,
-                "voice_profile_fingerprint": f"{selected_profile.fingerprint}:{text_fingerprint(ref_text)}",
+                "profile": {
+                    "voice_profile_id": selected_profile.id,
+                    "voice_profile_fingerprint": f"{selected_profile.fingerprint}:{text_fingerprint(ref_text)}",
+                },
             }
 
             info_cols = st.columns([1, 1])
@@ -759,6 +1331,9 @@ def main() -> None:
         left, right = st.columns([1, 1])
         with left:
             ref_audio_upload = st.file_uploader("临时源声音", type=PROFILE_AUDIO_TYPES)
+            ref_audio_path = _persist_upload_once(ref_audio_upload, "ref_audio", "temporary_ref_audio_upload")
+            if ref_audio_path is not None:
+                st.audio(str(ref_audio_path))
         with right:
             ref_text = st.text_area(
                 "参考音频文本",
@@ -766,7 +1341,17 @@ def main() -> None:
                 height=140,
                 help="需要与临时源声音实际朗读内容一致。",
             ).strip()
-        profile_metadata = {"voice_profile_id": "temporary_upload"}
+        profile_metadata = {"profile": {"voice_profile_id": "temporary_upload"}}
+
+    reference_quality_status = _reference_quality_status(
+        ref_audio_path=ref_audio_path,
+        ref_text=ref_text,
+        profile=selected_profile,
+        profile_mode=profile_mode,
+    )
+    _show_reference_quality_card(reference_quality_status)
+    if not _can_generate_with_reference_quality(reference_quality_status):
+        st.warning(REFERENCE_RETRY_PROMPT)
 
     with st.expander("管理声音 Profile", expanded=False):
         st.caption("保存后的 profile 会放在 voices/profiles/，默认不会提交到 Git。")
@@ -793,18 +1378,25 @@ def main() -> None:
                     if saved_audio is None:
                         st.error("源声音保存失败。")
                     else:
-                        saved_profile = save_profile(
-                            APP_DIR,
-                            display_name=profile_name,
-                            audio_source=saved_audio,
-                            transcript=profile_transcript,
-                            description=profile_description,
-                            default_preset=profile_preset,
-                            profile_id=slugify_profile_id(profile_name),
-                        )
-                        st.session_state["selected_voice_profile_id"] = saved_profile.id
-                        st.success(f"已保存 Profile: {saved_profile.display_name}")
-                        st.rerun()
+                        try:
+                            saved_profile = save_profile(
+                                APP_DIR,
+                                display_name=profile_name,
+                                audio_source=saved_audio,
+                                transcript=profile_transcript,
+                                description=profile_description,
+                                default_preset=profile_preset,
+                                profile_id=slugify_profile_id(profile_name),
+                            )
+                        except ReferenceAudioError as exc:
+                            st.error(f"参考音频质量不合格，未保存 Profile: {exc}")
+                            st.warning(REFERENCE_RETRY_PROMPT)
+                        except Exception as exc:
+                            st.error(f"保存 Profile 失败: {exc}")
+                        else:
+                            st.session_state["selected_voice_profile_id"] = saved_profile.id
+                            st.success(f"已保存 Profile: {saved_profile.display_name}")
+                            st.rerun()
         with manage_cols[1]:
             user_profiles = [profile for profile in profiles if not profile.built_in]
             if user_profiles:
@@ -839,7 +1431,13 @@ def main() -> None:
     else:
         st.info("输入、导入或抽取稿件后可预览切分结果。")
 
-    generate = st.button("生成播客音频", type="primary", use_container_width=True)
+    reference_can_generate = _can_generate_with_reference_quality(reference_quality_status)
+    generate = st.button(
+        "生成播客音频",
+        type="primary",
+        use_container_width=True,
+        disabled=not reference_can_generate,
+    )
     if generate:
         errors = []
         if not target_text:
@@ -847,39 +1445,49 @@ def main() -> None:
         if not model_ref:
             errors.append("请先选择可用模型。")
         if not ref_text:
-            errors.append("请填写参考音频文本。")
-
-        if profile_mode == "临时上传源声音" and ref_audio_upload is not None:
-            ref_audio_path = _persist_upload(ref_audio_upload, "ref_audio")
-            if ref_audio_path is not None:
-                profile_metadata = {
-                    "voice_profile_id": "temporary_upload",
-                    "voice_profile_fingerprint": f"temporary_upload:{ref_audio_upload.name}:{ref_audio_upload.size}:{text_fingerprint(ref_text)}",
-                }
+            errors.append(REFERENCE_RETRY_PROMPT)
 
         if ref_audio_path is None:
-            errors.append("请提供参考音频。")
+            errors.append(REFERENCE_RETRY_PROMPT)
         elif not ref_audio_path.exists():
             errors.append("参考音频文件不存在。")
         if selected_profile is not None and selected_profile.needs_transcript and not ref_text:
-            errors.append("这个声音 Profile 缺少参考文本，请先补全后再生成。")
+            errors.append(REFERENCE_RETRY_PROMPT)
+        if not reference_can_generate:
+            errors.append(REFERENCE_RETRY_PROMPT)
+
+        if profile_mode == "临时上传源声音" and ref_audio_upload is not None and ref_audio_path is not None:
+            profile_metadata = {
+                "profile": {
+                    "voice_profile_id": "temporary_upload",
+                    "voice_profile_fingerprint": f"temporary_upload:{ref_audio_upload.name}:{ref_audio_upload.size}:{text_fingerprint(ref_text)}",
+                },
+            }
 
         if errors:
-            for error in errors:
+            for error in dict.fromkeys(errors):
                 st.error(error)
         else:
             assert ref_audio_path is not None
             if not resume and checkpoint_path.exists():
-                _safe_remove(str(checkpoint_path))
+                safe_remove(str(checkpoint_path))
 
             try:
+                _maybe_clear_cached_model(backend)
                 with st.status("加载模型并生成音频...", expanded=True) as status:
                     st.write(f"后端: {backend}")
                     st.write(f"模型: {model_ref}")
-                    cache_token = get_backend_model_cache_token(backend, model_ref)
-                    model, resolved_ref = _load_model_cached(backend, model_ref, cache_token)
+                    model, resolved_ref = _load_model_cached(backend, model_ref)
                     st.write(f"已加载模型: {resolved_ref}")
                     st.write(f"生成 {len(chunks)} 段到 {output_path.relative_to(APP_DIR)}")
+                    progress_bar = st.progress(0, text="等待生成...")
+
+                    def on_chunk_done(current: int, total: int, label: str) -> None:
+                        progress_bar.progress(
+                            current / total,
+                            text=f"第 {current}/{total} 段完成: {label}",
+                        )
+
                     result = generate_podcast(
                         model=model,
                         backend=backend,
@@ -894,9 +1502,13 @@ def main() -> None:
                         checkpoint_metadata=profile_metadata,
                         output_format=output_format,
                         normalise=normalise,
+                        keep_segments=True,
+                        model_ref=model_ref,
+                        progress_callback=on_chunk_done,
                     )
                     if not result:
-                        raise RuntimeError("Generation returned no output path.")
+                        raise RuntimeError(_generation_failure_message(output_path, output_path))
+                    progress_bar.empty()
                     status.update(label="生成完成", state="complete", expanded=False)
 
                 final_path = Path(result)
@@ -920,8 +1532,11 @@ def main() -> None:
                             mime="audio/mpeg",
                             key=f"download_generated_{mp3_path.name}_{mp3_path.stat().st_mtime}",
                         )
+                _show_quality_report(final_path, output_path)
             except Exception as exc:
                 st.error(f"生成失败: {exc}")
+                if _has_quality_artifacts(output_path, output_path):
+                    _show_quality_report(output_path, output_path)
                 if checkpoint_path.exists():
                     st.warning(f"已保留断点，可继续生成: {checkpoint_path.relative_to(APP_DIR)}")
 
