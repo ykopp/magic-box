@@ -2,27 +2,37 @@
 
 > 最后更新：2026-06-22
 
-当前版本：V2.3.0
+当前版本：V2.3.1
 
 Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS** 和 **VoxCPM2** 两个 MLX 原生后端。
 
 - `streamlit_app.py`：Web 生产台，支持 URL 正文抽取、长文切分、断点续跑、多人源声音 Profile、模型管理、生成实时进度。
 - `podcast_generator.py`：CLI 长文生成，适合批处理和固定脚本。
+- `skills/magic-box-tts/`：Codex/Hermes 友好的 CLI Skill，适合把长音频生成投递到另一台 Apple Silicon Mac。
+- `scripts/bootstrap_mac.sh` / `scripts/sync_update.sh`：新 Mac 部署和后续 GitHub 同步更新入口。
 
 > 本目录是经过 2026-06-17 合并整理后的唯一工作目录。原 `/Users/liuchang/Workspaces/Apprun/chenxi/Magic Box/`（旧 V2.0.0）已被删除，所有代码 / 配置已合并到本目录；原 `/Users/liuchang/Apprun/chenxi/Magic Box/`（旧 V1.5.7）已被本目录的 V2.0.0 内容覆盖。完整备份在 `~/MagicBox-Backup-20260617/`。
 
 ## 最近更新
 
+### v2.3.1（2026-06-22 GitHub 部署 + Hermes 同步）
+
+- **GitHub 作为统一发布源**：Web、CLI、Skill、部署脚本和文档都保留在仓库内。两台 Mac 都从同一分支拉取更新，私有模型、声音 Profile 和生成输出继续只留在本机。
+- **Home Mac 一键部署/更新脚本**：新增 `scripts/bootstrap_mac.sh` 和 `scripts/sync_update.sh`，用于首次 clone、创建 `.venv`、安装依赖、安装 Skill symlink，以及后续 `git pull --ff-only` 同步更新。
+- **Hermes 运行路径标准化**：`skills/magic-box-tts/scripts/magic_box_tts.py` 是远程/家里 Mac 的固定 CLI 入口，支持 `--print-command` 生成可投递给 Hermes 的命令。
+- **进程生命周期修复**：Web 和 Skill 调用生成器时默认带 `--force-exit-after-run`，避免 MP3 已产出但底层 MLX/Python 子进程迟迟不退出。
+- **全局防并发生成**：Web 端会检测任何仍在运行的 `podcast_generator.py`，不再只检查同一输出文件，避免两个长文生成任务抢 CPU/内存。
+
 ### v2.3.0（2026-06-22 子进程生成 + 常驻进度监控）
 
 - **模型推理隔离到独立 Python 子进程**（`streamlit_app.py`）：Web 端不再在 Streamlit 主进程内直接加载 Qwen / VoxCPM 模型。底层 MLX 崩溃或被中断时，页面服务会继续保留，断点和质量报告仍可查看。
 - **常驻生成监控**（`streamlit_app.py`）：切分预览上方会显示当前后台生成进程 PID、运行时间、CPU、已完成段数、segment 文件数、估算进度和预计剩余时间；页面会定时刷新监控，不再只依赖按钮点击后的临时状态块。
-- **防重复启动**（`streamlit_app.py`）：同一输出文件正在生成时，“生成播客音频”按钮会禁用，避免多个 `podcast_generator.py` 子进程同时写同一个 MP3 / checkpoint。
+- **防重复启动**（`streamlit_app.py`）：有任何 `podcast_generator.py` 正在生成时，“生成播客音频”按钮会禁用，避免多个 Qwen / VoxCPM 子进程同时抢 CPU、内存或写 checkpoint。
 - **默认断点续跑开启**：Web 端“从断点继续”默认打开。长文生成中断后，保持同一个输出文件名即可续跑已完成片段。
 - **Qwen 默认语速更慢**：Web 端 Qwen 显示语速会按 `0.90` 折算后传给生成器；显示 `1.00` 实际传入 `0.90`，显示 `0.95` 实际传入 `0.855`。生成器仍会在 CLI 内按参考音频语速做二次校准，并把最终 `model_speed` 写入 checkpoint / quality report。
 - **CLI 与 Web 参数统一**（`podcast_generator.py`）：CLI 增加 `--chunk-max-chars` 和 `--checkpoint-metadata-file`，Web 子进程调用可以完整传递切分上限、Profile 指纹、断点元数据和输出格式。
 
-相关 UI / 子进程测试覆盖增至 **119**，包含子进程异常尾日志、进度快照、ETA 估算、进程时间解析和 Qwen 显示语速折算。
+相关 UI / 子进程测试覆盖增至 **120**，包含子进程异常尾日志、进度快照、ETA 估算、进程时间解析、Qwen 显示语速折算和后台进程扫描。
 
 ### v2.2.0（2026-06-21 参考语速校准 + 项目清理）
 
@@ -115,6 +125,50 @@ python3 streamlit_app.py
 cd /Users/liuchang/Apprun/chenxi/Magic\ Box
 make run-streamlit
 ```
+
+## GitHub 部署与同步
+
+这个仓库同时服务两种运行方式：
+
+- 当前 Mac 跑 Web 生产台：用 Streamlit 交互、管理声音 Profile、试听和下载输出。
+- 家里 M2 / Hermes Mac 跑长任务：用 Skill CLI 接收文本并在那台机器本地生成 MP3，当前电脑不用一直开着。
+
+GitHub 应只保存可复用能力：源码、测试、Skill、部署脚本和文档。以下内容默认不提交：`models/`、`.venv/`、`voices/profiles/`、`outputs/`、`runtime/`、个人参考音频和生成结果。
+
+### 新 Mac 首次部署
+
+在目标 Mac 上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ykopp/magic-box/codex/interactive-web-app/scripts/bootstrap_mac.sh | bash
+```
+
+如需自定义目录或分支：
+
+```bash
+MAGIC_BOX_DIR="$HOME/Apprun/chenxi/Magic Box" \
+MAGIC_BOX_BRANCH="codex/interactive-web-app" \
+curl -fsSL https://raw.githubusercontent.com/ykopp/magic-box/codex/interactive-web-app/scripts/bootstrap_mac.sh | bash
+```
+
+部署脚本会 clone 仓库、切到指定分支、创建 `.venv`、安装 Python 依赖、安装 `ffmpeg`（如果本机有 Homebrew），并把 `skills/magic-box-tts` 链接到 `~/.codex/skills/`。模型文件和个人声音 Profile 仍需手动复制，因为它们体积大且是私有数据。
+
+### 后续同步更新
+
+每次这边更新并推送 GitHub 后，另一台 Mac 执行：
+
+```bash
+cd "$HOME/Apprun/chenxi/Magic Box"
+make sync-update
+```
+
+或直接：
+
+```bash
+bash scripts/sync_update.sh
+```
+
+同步脚本会 `git pull --ff-only`、刷新 `.venv` 依赖，并重新安装 Skill symlink。它不会删除模型、声音 Profile 或输出文件；如果代码目录有未提交改动，会先停止，避免覆盖本地修改。
 
 ## Web 生产台
 
@@ -313,6 +367,8 @@ utils.py                # 音频转换、checkpoint、切分等工具
 app_styles.css          # Streamlit 暗色主题 CSS
 Makefile                # 日常命令 (install/test/lint/clean)
 pyproject.toml          # 项目元数据和工具配置
+scripts/                # Mac 部署、同步更新脚本
+skills/magic-box-tts/   # Codex/Hermes CLI Skill
 model_route_cli.py      # 模型路由 CLI 工具
 benchmark_tts_backends.py # TTS 后端基准对比
 download_model.py       # 手动模型下载脚本
@@ -321,7 +377,7 @@ voices/profiles/        # 用户保存的声音 Profile
 outputs/                # 生成结果、quality_report.json、.<output>_segments/
 models/                 # 本地模型
 runtime/                # 临时上传文件
-tests/                  # 单元测试 (119 个)
+tests/                  # 单元测试 (120 个)
 使用指南.md             # 中文使用指南（保留自 V1.5.7）
 项目交接文档.md         # 项目交接文档（保留自 V1.5.7）
 ```

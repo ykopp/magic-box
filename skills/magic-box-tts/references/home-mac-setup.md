@@ -25,6 +25,14 @@ voices/profiles/<profile_id>/
 
 ## First-Time Setup Sketch
 
+Recommended one-command setup from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ykopp/magic-box/codex/interactive-web-app/scripts/bootstrap_mac.sh | bash
+```
+
+Equivalent manual setup:
+
 ```bash
 mkdir -p "/Users/liuchang/Apprun/chenxi"
 cd "/Users/liuchang/Apprun/chenxi"
@@ -39,6 +47,34 @@ brew install ffmpeg
 
 Model download and profile transfer are intentionally not automated here because model files and personal voice data are large/private.
 
+## Sync Updates From GitHub
+
+After a Magic Box update is pushed, run this on the target Mac:
+
+```bash
+cd "/Users/liuchang/Apprun/chenxi/Magic Box"
+make sync-update
+```
+
+or:
+
+```bash
+bash scripts/sync_update.sh
+```
+
+The sync script pulls the configured branch with `--ff-only`, refreshes `.venv`, and relinks the bundled skill into `~/.codex/skills/` when that folder exists. It leaves `models/`, `voices/profiles/`, `outputs/`, and `runtime/` local.
+
+## Web On A Mac
+
+To run the Streamlit production UI on a Mac:
+
+```bash
+cd "/Users/liuchang/Apprun/chenxi/Magic Box"
+make run-streamlit
+```
+
+The default URL is `http://127.0.0.1:8507/`.
+
 ## Hermes Pattern
 
 When Hermes is available on the target Mac, generate or send a shell command that:
@@ -49,3 +85,23 @@ When Hermes is available on the target Mac, generate or send a shell command tha
 4. Returns the final output path and `quality_report.json` status.
 
 Prefer this over running long generation on the current laptop.
+
+Example command to send through Hermes:
+
+```bash
+cd "/Users/liuchang/Apprun/chenxi/Magic Box" && \
+python3 skills/magic-box-tts/scripts/magic_box_tts.py \
+  --text "要朗读的正文" \
+  --profile 刘畅 \
+  --output outputs/story.mp3
+```
+
+To generate an escaped command without running locally:
+
+```bash
+python3 skills/magic-box-tts/scripts/magic_box_tts.py \
+  --text "要朗读的正文" \
+  --profile 刘畅 \
+  --output outputs/story.mp3 \
+  --print-command
+```

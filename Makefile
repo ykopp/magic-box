@@ -1,4 +1,4 @@
-.PHONY: install test lint format run-streamlit run-cli route benchmark clean help
+.PHONY: install test lint format run-streamlit run-cli route benchmark sync-update install-skill clean help
 
 PYTHON ?= python3
 VENV ?= .venv
@@ -18,6 +18,8 @@ help:
 	@echo "  run-cli         Run the CLI generator (pass ARGS=...)"
 	@echo "  route           Inspect model routing decisions"
 	@echo "  benchmark       Run TTS backend benchmark"
+	@echo "  sync-update     Pull latest GitHub code and refresh local venv"
+	@echo "  install-skill   Link the bundled Codex/Hermes skill into ~/.codex/skills"
 	@echo "  clean           Remove caches, runtime, and __pycache__"
 
 install:
@@ -47,6 +49,13 @@ route:
 
 benchmark:
 	$(PY) benchmark_tts_backends.py $(ARGS)
+
+sync-update:
+	bash scripts/sync_update.sh
+
+install-skill:
+	mkdir -p "$(HOME)/.codex/skills"
+	ln -sfn "$(CURDIR)/skills/magic-box-tts" "$(HOME)/.codex/skills/magic-box-tts"
 
 clean:
 	find outputs -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
