@@ -1,8 +1,8 @@
 # Magic Box
 
-> 最后更新：2026-06-21
+> 最后更新：2026-06-22
 
-当前版本：V2.2.0
+当前版本：V2.3.0
 
 Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS** 和 **VoxCPM2** 两个 MLX 原生后端。
 
@@ -12,6 +12,17 @@ Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS**
 > 本目录是经过 2026-06-17 合并整理后的唯一工作目录。原 `/Users/liuchang/Workspaces/Apprun/chenxi/Magic Box/`（旧 V2.0.0）已被删除，所有代码 / 配置已合并到本目录；原 `/Users/liuchang/Apprun/chenxi/Magic Box/`（旧 V1.5.7）已被本目录的 V2.0.0 内容覆盖。完整备份在 `~/MagicBox-Backup-20260617/`。
 
 ## 最近更新
+
+### v2.3.0（2026-06-22 子进程生成 + 常驻进度监控）
+
+- **模型推理隔离到独立 Python 子进程**（`streamlit_app.py`）：Web 端不再在 Streamlit 主进程内直接加载 Qwen / VoxCPM 模型。底层 MLX 崩溃或被中断时，页面服务会继续保留，断点和质量报告仍可查看。
+- **常驻生成监控**（`streamlit_app.py`）：切分预览上方会显示当前后台生成进程 PID、运行时间、CPU、已完成段数、segment 文件数、估算进度和预计剩余时间；页面会定时刷新监控，不再只依赖按钮点击后的临时状态块。
+- **防重复启动**（`streamlit_app.py`）：同一输出文件正在生成时，“生成播客音频”按钮会禁用，避免多个 `podcast_generator.py` 子进程同时写同一个 MP3 / checkpoint。
+- **默认断点续跑开启**：Web 端“从断点继续”默认打开。长文生成中断后，保持同一个输出文件名即可续跑已完成片段。
+- **Qwen 默认语速更慢**：Web 端 Qwen 显示语速会按 `0.90` 折算后传给生成器；显示 `1.00` 实际传入 `0.90`，显示 `0.95` 实际传入 `0.855`。生成器仍会在 CLI 内按参考音频语速做二次校准，并把最终 `model_speed` 写入 checkpoint / quality report。
+- **CLI 与 Web 参数统一**（`podcast_generator.py`）：CLI 增加 `--chunk-max-chars` 和 `--checkpoint-metadata-file`，Web 子进程调用可以完整传递切分上限、Profile 指纹、断点元数据和输出格式。
+
+相关 UI / 子进程测试覆盖增至 **119**，包含子进程异常尾日志、进度快照、ETA 估算、进程时间解析和 Qwen 显示语速折算。
 
 ### v2.2.0（2026-06-21 参考语速校准 + 项目清理）
 
@@ -112,10 +123,10 @@ Streamlit 页面用于正式长文播客生产：
 - 粘贴、上传 TXT（UTF-8 / GB18030，上限 50 MB），或从 URL 抽取文章正文，清除广告、订阅、分享等网页杂质后整理成播客稿。
 - 在 Qwen 和 VoxCPM2 两个后端间切换。Qwen 支持 speed / temperature / 模型路由；VoxCPM2 输出 48 kHz 高保真音频。
 - 选择已保存的"克隆声音 Profile"，或临时上传参考音频。
-- 使用"表达预设"（稳定清晰 / 自然播客 / 热情开场 / 沉稳叙事 / 快速草稿）和高级微调控制语速、随机性和单段字符上限；Qwen clone 下语速 `1.00` 表示尽量贴近参考音频语速。
+- 使用"表达预设"（稳定清晰 / 自然播客 / 热情开场 / 沉稳叙事 / 快速草稿）和高级微调控制语速、随机性和单段字符上限；Web 端 Qwen 显示语速会先按 `0.90` 折算，再交给生成器按参考音频语速校准。
 - 输出 WAV、MP3，或同时输出 WAV + MP3。
-- 开启"从断点继续"后，中断任务可按同一输出文件名续跑。断点文件 fingerprint 已改为内容哈希，跨机器可复用。
-- 生成过程中页面会显示进度条和每段状态，方便观察长文生成。
+- "从断点继续"默认开启，中断任务可按同一输出文件名续跑。断点文件 fingerprint 已改为内容哈希，跨机器可复用。
+- 生成过程中页面会显示常驻进度监控：子进程 PID、运行时间、CPU、当前段、已完成段、segment 文件数、估算进度和预计剩余时间。
 - 生成后会读取 `quality_report.json`，显示质量摘要、失败段编号和 `_seg_*.wav` 证据目录。
 - 生成后在页面底部输出库试听和下载所选格式。
 
@@ -163,6 +174,7 @@ python3 podcast_generator.py \
 - `--output`：输出路径；默认自动生成 `.mp3` 文件名。
 - `--format`：输出格式，支持 `wav`、`mp3`、`both`，默认 `mp3`。
 - `--resume`：从已有 `.ckpt` 断点继续。
+- `--chunk-max-chars`：每段最大字符数；Web 端会把滑块值原样传入 CLI。
 - `--backend`：`qwen`（默认）或 `voxcpm`。
 - `--speed` / `--temperature`：控制语速和表达随机性（仅 Qwen 后端）；Qwen clone 会把 `--speed 1.0` 按参考音频语速自动校准。
 - `--no-normalise`：跳过响度标准化。
@@ -284,7 +296,7 @@ voices/profiles/        # 用户保存的声音 Profile
 outputs/                # 生成结果、quality_report.json、.<output>_segments/
 models/                 # 本地模型
 runtime/                # 临时上传文件
-tests/                  # 单元测试 (113 个)
+tests/                  # 单元测试 (119 个)
 使用指南.md             # 中文使用指南（保留自 V1.5.7）
 项目交接文档.md         # 项目交接文档（保留自 V1.5.7）
 ```

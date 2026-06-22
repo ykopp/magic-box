@@ -4,7 +4,7 @@
 
 - Web app: `.venv/bin/python -m streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8507`
 - CLI: `.venv/bin/python podcast_generator.py --help`
-- Version: `V2.2.0`
+- Version: `V2.3.0`
 
 旧 Gradio UI 和 PyInstaller 打包产物已下线。当前正式工作流只维护 Streamlit Web app 和 CLI。
 

@@ -1,6 +1,6 @@
 [project]
 name = "magic-box"
-version = "2.2.0"
+version = "2.3.0"
 description = "Apple Silicon local TTS podcast studio (Qwen3-TTS + VoxCPM)"
 readme = "README.md"
 requires-python = ">=3.10"

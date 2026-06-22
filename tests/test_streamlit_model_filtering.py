@@ -7,8 +7,11 @@ from unittest.mock import patch
 
 from streamlit_app import (
     _can_generate_with_reference_quality,
+    _build_generation_command,
     _call_optional_reference_audit,
     _filter_model_choices_for_clone,
+    _effective_generation_speed,
+    _estimated_generation_progress,
     _generation_failure_message,
     _get_default_choice_index,
     _is_legacy_profile,
@@ -16,10 +19,13 @@ from streamlit_app import (
     _normalise_reference_quality_report,
     _profile_has_saved_reference,
     _profile_ref_text_key,
+    _parse_process_etime,
     _quality_report_issue_lines,
     _quality_report_failed_segments,
     _quality_report_summary,
     _reference_quality_status,
+    _generation_progress_snapshot,
+    _run_generation_subprocess,
     _segments_dir_from_report,
 )
 from tts_backends import BackendModelChoice
@@ -56,6 +62,11 @@ class StreamlitModelFilteringTest(unittest.TestCase):
         ]
 
         self.assertEqual(_filter_model_choices_for_clone("voxcpm", choices), choices)
+
+    def test_qwen_display_speed_uses_slightly_slower_generation_speed(self):
+        self.assertEqual(_effective_generation_speed("qwen", 1.0), 0.9)
+        self.assertEqual(_effective_generation_speed("qwen", 0.95), 0.855)
+        self.assertEqual(_effective_generation_speed("voxcpm", 1.0), 1.0)
 
     def test_default_index_uses_filtered_base_choices(self):
         choices = [
@@ -193,6 +204,108 @@ class StreamlitModelFilteringTest(unittest.TestCase):
             )
 
             self.assertIn("chunk 2/3: too quiet", _generation_failure_message(output_path, output_path))
+
+    def test_generation_subprocess_command_includes_stability_flags(self):
+        cmd = _build_generation_command(
+            text_path=Path("/tmp/request.txt"),
+            ref_audio_path=Path("/tmp/ref.wav"),
+            ref_text="reference text",
+            output_path=Path("/tmp/out.mp3"),
+            backend="qwen",
+            model_ref="/models/qwen",
+            speed=1.0,
+            temperature=0.85,
+            chunk_max_chars=260,
+            checkpoint_path=Path("/tmp/out.ckpt"),
+            metadata_path=Path("/tmp/meta.json"),
+            output_format="mp3",
+            normalise=False,
+            resume=True,
+        )
+
+        self.assertIn("podcast_generator.py", cmd[2])
+        self.assertIn("--chunk-max-chars", cmd)
+        self.assertEqual(cmd[cmd.index("--chunk-max-chars") + 1], "260")
+        self.assertIn("--checkpoint-metadata-file", cmd)
+        self.assertEqual(cmd[cmd.index("--checkpoint-metadata-file") + 1], "/tmp/meta.json")
+        self.assertIn("--no-normalise", cmd)
+        self.assertIn("--resume", cmd)
+
+    def test_generation_subprocess_nonzero_exit_reports_tail(self):
+        class FakeProcess:
+            stdout = iter(["line before crash\n", "Fatal Python error: GIL released\n"])
+            returncode = 133
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            runtime_dir = temp_path / "runtime"
+            output_dir = temp_path / "outputs"
+            ref_path = temp_path / "ref.wav"
+            ref_path.write_bytes(b"placeholder")
+
+            with (
+                patch("streamlit_app.RUNTIME_DIR", runtime_dir),
+                patch("streamlit_app.OUTPUT_DIR", output_dir),
+                patch("streamlit_app.subprocess.Popen", return_value=FakeProcess()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Fatal Python error"):
+                    _run_generation_subprocess(
+                        target_text="target",
+                        ref_audio_path=ref_path,
+                        ref_text="reference text",
+                        output_path=output_dir / "out.wav",
+                        backend="qwen",
+                        model_ref="/models/qwen",
+                        speed=1.0,
+                        temperature=0.85,
+                        chunk_max_chars=260,
+                        checkpoint_path=output_dir / "out.ckpt",
+                        checkpoint_metadata={"profile": {"voice_profile_id": "test"}},
+                        output_format="wav",
+                        normalise=True,
+                        resume=False,
+                    )
+
+    def test_generation_progress_snapshot_reads_checkpoint_and_segments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            output_path = output_dir / "story.mp3"
+            checkpoint_path = output_dir / "story.ckpt"
+            segment_dir = output_dir / ".story_segments"
+            segment_dir.mkdir()
+            (segment_dir / "_seg_0000.wav").write_bytes(b"wav")
+            checkpoint_path.write_text(json.dumps({"completed": [0, 1]}), encoding="utf-8")
+
+            snapshot = _generation_progress_snapshot(output_path, checkpoint_path, total_chunks=4)
+
+            self.assertEqual(snapshot["completed"], 2)
+            self.assertEqual(snapshot["current"], 3)
+            self.assertEqual(snapshot["total"], 4)
+            self.assertEqual(snapshot["segment_count"], 1)
+
+    def test_estimated_generation_progress_includes_current_segment_and_eta(self):
+        estimate = _estimated_generation_progress(
+            completed=1,
+            total=4,
+            elapsed_seconds=120,
+            current_segment_elapsed=30,
+            completed_segment_durations=[60],
+        )
+
+        self.assertGreater(estimate["ratio"], 0.25)
+        self.assertLess(estimate["ratio"], 1.0)
+        self.assertEqual(estimate["remaining_seconds"], 150)
+
+    def test_parse_process_etime_supports_ps_formats(self):
+        self.assertEqual(_parse_process_etime("14:42"), 882)
+        self.assertEqual(_parse_process_etime("01:02:03"), 3723)
+        self.assertEqual(_parse_process_etime("1-02:03:04"), 93784)
 
     def test_reference_quality_gate_does_not_affect_model_filtering(self):
         choices = [

@@ -11,6 +11,7 @@ Improvements over original:
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -848,6 +849,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="断点文件路径（默认: outputs/<output_name>.ckpt）",
     )
     parser.add_argument(
+        "--checkpoint-metadata-file",
+        default="",
+        help="包含断点元数据的 JSON 文件（供 Web UI 子进程调用）。",
+    )
+    parser.add_argument("--chunk-max-chars", type=int, default=80, help="每段最大字符数 (默认 80)")
+    parser.add_argument(
         "--model", "-m",
         default=MODEL_PATH,
         help="模型路径（默认 1.7B-Base）",
@@ -912,6 +919,15 @@ def main():
             safe_remove(checkpoint_path)
             checkpoint_path = None
 
+    checkpoint_metadata = None
+    if args.checkpoint_metadata_file:
+        try:
+            with open(args.checkpoint_metadata_file, "r", encoding="utf-8") as f:
+                checkpoint_metadata = json.load(f)
+        except Exception as exc:
+            print(f"✗ 断点元数据读取失败: {exc}")
+            sys.exit(1)
+
     # -- Model -------------------------------------------------------------
     print(f"\n{'=' * 60}")
     print("Magic Box")
@@ -932,7 +948,7 @@ def main():
         print("ℹ VoxCPM 为实验后端：不支持 Qwen 的 speed/temperature 控制，按原生推理参数运行。")
 
     # -- Generate ----------------------------------------------------------
-    generate_podcast(
+    result = generate_podcast(
         model=model,
         backend=args.backend,
         ref_audio_path=args.ref_audio,
@@ -941,11 +957,15 @@ def main():
         output_path=output_path,
         speed=args.speed,
         temperature=args.temperature,
+        chunk_max_chars=args.chunk_max_chars,
         checkpoint_path=checkpoint_path,
+        checkpoint_metadata=checkpoint_metadata,
         output_format=args.format,
         normalise=not args.no_normalise,
         model_ref=args.model,
     )
+    if not result:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

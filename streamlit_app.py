@@ -1,10 +1,15 @@
 import hashlib
+import html
 import importlib
 import json
 import logging
 import os
+import queue
 import re
+import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -20,8 +25,7 @@ if __name__ == "__main__" and get_script_run_ctx(suppress_warning=True) is None:
     )
 
 from article_extractor import extract_article_from_url
-from podcast_generator import generate_podcast
-from tts_backends import get_backend_model_choices, get_default_model_ref, load_backend_model
+from tts_backends import get_backend_model_choices, get_default_model_ref
 from utils import ReferenceAudioError, make_output_filename, safe_remove, split_text
 from voice_controls import get_preset, optimize_podcast_rhythm, preset_names
 from voice_profiles import delete_profile, list_profiles, save_profile, slugify_profile_id, text_fingerprint
@@ -43,6 +47,8 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 MAX_RUNTIME_BYTES = 500 * 1024 * 1024  # 500 MB of kept uploads
 PROFILE_AUDIO_TYPES = ["wav", "mp3", "m4a", "aac", "flac", "ogg"]
 REFERENCE_RETRY_PROMPT = "请重新提供 3-20 秒干净单人声，并填写逐字匹配文本。"
+QWEN_DISPLAY_TO_GENERATION_SPEED = 0.90
+DEFAULT_SEGMENT_SECONDS = 120.0
 
 
 st.set_page_config(
@@ -480,18 +486,402 @@ def _get_default_choice_index(choices: list, backend: str) -> int:
     return 0
 
 
-@st.cache_resource(show_spinner=False)
-def _load_model_cached(backend: str, model_ref: str):
-    model, resolved_ref = load_backend_model(backend, model_ref)
-    return model, resolved_ref
+def _effective_generation_speed(backend: str, display_speed: float) -> float:
+    if backend == "qwen":
+        return round(float(display_speed) * QWEN_DISPLAY_TO_GENERATION_SPEED, 3)
+    return float(display_speed)
 
 
-def _maybe_clear_cached_model(backend: str) -> None:
-    """Drop any cached model whose backend differs from *backend*."""
-    previous = st.session_state.get("_cached_model_backend")
-    if previous is not None and previous != backend:
-        _load_model_cached.clear()
-    st.session_state["_cached_model_backend"] = backend
+def _build_generation_command(
+    *,
+    text_path: Path,
+    ref_audio_path: Path,
+    ref_text: str,
+    output_path: Path,
+    backend: str,
+    model_ref: str,
+    speed: float,
+    temperature: float,
+    chunk_max_chars: int,
+    checkpoint_path: Path,
+    metadata_path: Path,
+    output_format: str,
+    normalise: bool,
+    resume: bool,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        str(APP_DIR / "podcast_generator.py"),
+        "--file",
+        str(text_path),
+        "--ref-audio",
+        str(ref_audio_path),
+        "--ref-text",
+        ref_text,
+        "--output",
+        str(output_path),
+        "--backend",
+        backend,
+        "--model",
+        model_ref,
+        "--speed",
+        str(speed),
+        "--temperature",
+        str(temperature),
+        "--chunk-max-chars",
+        str(chunk_max_chars),
+        "--checkpoint",
+        str(checkpoint_path),
+        "--checkpoint-metadata-file",
+        str(metadata_path),
+        "--format",
+        output_format,
+    ]
+    if not normalise:
+        command.append("--no-normalise")
+    if resume:
+        command.append("--resume")
+    return command
+
+
+def _run_generation_subprocess(
+    *,
+    target_text: str,
+    ref_audio_path: Path,
+    ref_text: str,
+    output_path: Path,
+    backend: str,
+    model_ref: str,
+    speed: float,
+    temperature: float,
+    chunk_max_chars: int,
+    checkpoint_path: Path,
+    checkpoint_metadata: dict[str, Any],
+    output_format: str,
+    normalise: bool,
+    resume: bool,
+    log_callback=None,
+    process_callback=None,
+    heartbeat_callback=None,
+    heartbeat_interval: float = 1.0,
+) -> Path:
+    """Run MLX generation in a child process so native crashes cannot kill Streamlit."""
+
+    _ensure_dirs()
+    _enforce_runtime_quota()
+    request_id = uuid4().hex
+    text_path = RUNTIME_DIR / f"generation_{request_id}.txt"
+    metadata_path = RUNTIME_DIR / f"generation_{request_id}.metadata.json"
+    text_path.write_text(target_text, encoding="utf-8")
+    metadata_path.write_text(json.dumps(checkpoint_metadata or {}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    command = _build_generation_command(
+        text_path=text_path,
+        ref_audio_path=ref_audio_path,
+        ref_text=ref_text,
+        output_path=output_path,
+        backend=backend,
+        model_ref=model_ref,
+        speed=speed,
+        temperature=temperature,
+        chunk_max_chars=chunk_max_chars,
+        checkpoint_path=checkpoint_path,
+        metadata_path=metadata_path,
+        output_format=output_format,
+        normalise=normalise,
+        resume=resume,
+    )
+    output_lines: list[str] = []
+    process = subprocess.Popen(
+        command,
+        cwd=str(APP_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    if process_callback is not None:
+        process_callback(process.pid)
+    assert process.stdout is not None
+    line_queue: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                line_queue.put(line)
+        finally:
+            line_queue.put(None)
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stdout_thread.start()
+
+    start_time = time.monotonic()
+    last_heartbeat = 0.0
+    stdout_done = False
+    returncode: int | None = None
+    while True:
+        try:
+            line = line_queue.get(timeout=0.2)
+        except queue.Empty:
+            line = None
+        else:
+            if line is None:
+                stdout_done = True
+            else:
+                clean_line = line.rstrip()
+                if clean_line:
+                    output_lines.append(clean_line)
+                    if log_callback is not None:
+                        log_callback(clean_line)
+
+        now = time.monotonic()
+        if heartbeat_callback is not None and now - last_heartbeat >= heartbeat_interval:
+            heartbeat_callback(now - start_time, output_lines[-1] if output_lines else "")
+            last_heartbeat = now
+
+        returncode = process.poll()
+        if returncode is not None and stdout_done:
+            break
+
+    stdout_thread.join(timeout=1)
+    if returncode is None:
+        returncode = process.wait()
+    if returncode != 0:
+        tail = "\n".join(output_lines[-12:])
+        message = _generation_failure_message(output_path, output_path)
+        if "未找到可解析的质量报告" in message and tail:
+            message = f"生成子进程异常退出（退出码 {returncode}）。最近日志:\n{tail}"
+        else:
+            message = f"{message}（子进程退出码 {returncode}）"
+        raise RuntimeError(message)
+
+    if output_path.exists():
+        return output_path
+    report_path, report = _load_quality_report(output_path, output_path)
+    if isinstance(report, dict) and isinstance(report.get("result_path"), str):
+        result_path = Path(report["result_path"])
+        if result_path.exists():
+            return result_path
+    raise RuntimeError(_generation_failure_message(output_path, output_path))
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None:
+        return "估算中"
+    if seconds < 60:
+        return f"约 {max(1, int(seconds))} 秒"
+    minutes = int(round(seconds / 60))
+    if minutes < 60:
+        return f"约 {minutes} 分钟"
+    hours, minutes = divmod(minutes, 60)
+    return f"约 {hours} 小时 {minutes} 分钟"
+
+
+def _estimated_generation_progress(
+    *,
+    completed: int,
+    total: int,
+    elapsed_seconds: float,
+    current_segment_elapsed: float,
+    completed_segment_durations: list[float],
+) -> dict[str, float | None]:
+    if total <= 0:
+        return {"ratio": 0.0, "remaining_seconds": None}
+    if completed >= total:
+        return {"ratio": 1.0, "remaining_seconds": 0.0}
+
+    if completed_segment_durations:
+        segment_seconds = max(10.0, sum(completed_segment_durations) / len(completed_segment_durations))
+    elif completed > 0:
+        segment_seconds = max(10.0, elapsed_seconds / completed)
+    else:
+        segment_seconds = DEFAULT_SEGMENT_SECONDS
+
+    current_fraction = min(0.95, max(0.0, current_segment_elapsed / segment_seconds))
+    estimated_units = completed + current_fraction
+    ratio = min(0.99, max(0.0, estimated_units / total))
+    remaining_units = max(0.0, total - estimated_units)
+    return {
+        "ratio": ratio,
+        "remaining_seconds": remaining_units * segment_seconds,
+    }
+
+
+def _generation_progress_snapshot(output_path: Path, checkpoint_path: Path, total_chunks: int) -> dict[str, Any]:
+    completed: set[int] = set()
+    if checkpoint_path.exists():
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        for item in checkpoint.get("completed", []):
+            if isinstance(item, int):
+                completed.add(item)
+
+    segment_dir = output_path.parent / f".{output_path.stem}_segments"
+    segment_count = 0
+    if segment_dir.exists():
+        for path in segment_dir.glob("_seg_*.wav"):
+            segment_count += 1
+            match = re.search(r"_seg_(\d+)\.wav$", path.name)
+            if match:
+                completed.add(int(match.group(1)))
+
+    completed_count = min(len(completed), total_chunks)
+    return {
+        "completed": completed_count,
+        "total": total_chunks,
+        "current": min(completed_count + 1, total_chunks) if total_chunks else 0,
+        "segment_count": segment_count,
+        "segment_dir": segment_dir,
+    }
+
+
+def _parse_process_etime(etime: str) -> float | None:
+    try:
+        days = 0
+        value = etime.strip()
+        if "-" in value:
+            day_text, value = value.split("-", 1)
+            days = int(day_text)
+        parts = [int(part) for part in value.split(":")]
+        if len(parts) == 2:
+            minutes, seconds = parts
+            hours = 0
+        elif len(parts) == 3:
+            hours, minutes, seconds = parts
+        else:
+            return None
+        return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+    except (TypeError, ValueError):
+        return None
+
+
+def _generation_process_snapshot(output_path: Path) -> dict[str, Any] | None:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,stat=,pcpu=,pmem=,etime=,command="],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    output_token = str(output_path)
+    for line in output.splitlines():
+        if "podcast_generator.py" not in line or output_token not in line:
+            continue
+        parts = line.strip().split(None, 6)
+        if len(parts) < 7:
+            continue
+        pid, ppid, stat, cpu, mem, etime, command = parts
+        try:
+            pid_value = int(pid)
+        except ValueError:
+            continue
+        return {
+            "pid": pid_value,
+            "ppid": ppid,
+            "stat": stat,
+            "cpu": cpu,
+            "mem": mem,
+            "etime": etime,
+            "elapsed_seconds": _parse_process_etime(etime),
+            "command": command,
+        }
+    return None
+
+
+def _checkpoint_saved_at(checkpoint_path: Path) -> float | None:
+    try:
+        return checkpoint_path.stat().st_mtime
+    except OSError:
+        return None
+
+
+@st.fragment(run_every=2)
+def _show_generation_monitor(output_path: Path, checkpoint_path: Path, total_chunks: int) -> None:
+    if total_chunks <= 0:
+        return
+
+    snapshot = _generation_progress_snapshot(output_path, checkpoint_path, total_chunks)
+    process = _generation_process_snapshot(output_path)
+    completed = int(snapshot["completed"])
+    total = int(snapshot["total"])
+    has_artifacts = checkpoint_path.exists() or Path(snapshot["segment_dir"]).exists()
+    if process is None and not has_artifacts:
+        return
+    if process is None and output_path.exists() and completed >= total:
+        return
+
+    process_elapsed = process.get("elapsed_seconds") if process else None
+    elapsed_seconds = float(process_elapsed or 0.0)
+    now = time.time()
+    saved_at = _checkpoint_saved_at(checkpoint_path)
+    if process_elapsed is not None and saved_at is not None:
+        current_segment_elapsed = max(0.0, now - saved_at)
+    elif process_elapsed is not None:
+        current_segment_elapsed = elapsed_seconds
+    else:
+        current_segment_elapsed = 0.0
+
+    if completed > 0 and elapsed_seconds > 0:
+        average_segment_seconds = max(10.0, elapsed_seconds / completed)
+        completed_durations = [average_segment_seconds] * completed
+    else:
+        completed_durations = []
+
+    estimate = _estimated_generation_progress(
+        completed=completed,
+        total=total,
+        elapsed_seconds=elapsed_seconds,
+        current_segment_elapsed=current_segment_elapsed,
+        completed_segment_durations=completed_durations,
+    )
+    ratio = float(estimate["ratio"] or 0.0)
+
+    st.subheader("当前生成进度")
+    if process is not None:
+        st.info(
+            " | ".join(
+                [
+                    f"生成子进程 PID: {process['pid']}",
+                    f"运行时间: {process['etime']}",
+                    f"CPU: {process['cpu']}%",
+                    f"预计剩余: {_format_eta(estimate['remaining_seconds'])}",
+                ]
+            )
+        )
+    else:
+        st.warning("没有检测到正在运行的生成子进程；已保留断点，重新点击生成会从断点继续。")
+
+    if completed >= total:
+        label = f"已完成 {completed}/{total} 段，正在收尾或拼接输出"
+    else:
+        label = f"估算进度 {ratio * 100:.0f}% | 正在第 {snapshot['current']}/{total} 段，已完成 {completed}/{total} 段"
+    st.progress(ratio, text=label)
+    st.caption(
+        " | ".join(
+            [
+                f"segment 文件: {snapshot['segment_count']}",
+                f"断点: {checkpoint_path.relative_to(APP_DIR) if checkpoint_path.exists() else '暂无'}",
+                f"输出: {output_path.relative_to(APP_DIR)}",
+            ]
+        )
+    )
 
 
 def _recent_outputs(limit: int = 10) -> list[Path]:
@@ -1099,6 +1489,9 @@ def main() -> None:
                 key="voice_speed",
                 help="控制相对参考音频的朗读速度。Qwen clone 下 1.00 会先按参考音频语速折算成模型 speed；过高更容易吞字、断裂或音色漂移。",
             )
+            effective_speed = _effective_generation_speed(backend, speed)
+            if backend == "qwen":
+                st.caption(f"显示语速 {speed:.2f}；实际传入生成器 {effective_speed:.2f}。")
             if backend == "qwen" and speed > 1.05:
                 st.warning("Qwen clone 语速高于 1.05 时坏段风险会上升。")
             temperature = st.slider(
@@ -1129,7 +1522,7 @@ def main() -> None:
         normalise = st.toggle("响度标准化", value=True)
         resume = st.toggle(
             "从断点继续",
-            value=False,
+            value=True,
             help=(
                 "长文生成会按 chunk 保存进度；中断后保持同一个输出文件名，"
                 "打开这里会跳过已完成片段继续生成。成功完成后断点会自动清理。"
@@ -1420,6 +1813,7 @@ def main() -> None:
     stats[2].metric("预估成片", _estimate_duration_label(len(target_text)))
     stats[3].metric("断点", "继续" if resume else "重建")
     st.markdown(f'<span class="file-path">输出路径: {output_path.relative_to(APP_DIR)}</span>', unsafe_allow_html=True)
+    _show_generation_monitor(output_path, checkpoint_path, len(chunks))
 
     if chunks:
         preview_text = "\n\n".join(
@@ -1432,12 +1826,15 @@ def main() -> None:
         st.info("输入、导入或抽取稿件后可预览切分结果。")
 
     reference_can_generate = _can_generate_with_reference_quality(reference_quality_status)
+    active_generation = _generation_process_snapshot(output_path)
     generate = st.button(
         "生成播客音频",
         type="primary",
         use_container_width=True,
-        disabled=not reference_can_generate,
+        disabled=not reference_can_generate or active_generation is not None,
     )
+    if active_generation is not None:
+        st.caption(f"当前输出正在生成中，已禁用重复启动。PID: {active_generation['pid']}")
     if generate:
         errors = []
         if not target_text:
@@ -1473,45 +1870,98 @@ def main() -> None:
                 safe_remove(str(checkpoint_path))
 
             try:
-                _maybe_clear_cached_model(backend)
-                with st.status("加载模型并生成音频...", expanded=True) as status:
+                with st.status("在隔离子进程中生成音频...", expanded=True) as status:
                     st.write(f"后端: {backend}")
                     st.write(f"模型: {model_ref}")
-                    model, resolved_ref = _load_model_cached(backend, model_ref)
-                    st.write(f"已加载模型: {resolved_ref}")
+                    if backend == "qwen":
+                        st.write(f"语速: 显示 {speed:.2f} → 实际参数 {effective_speed:.2f}")
                     st.write(f"生成 {len(chunks)} 段到 {output_path.relative_to(APP_DIR)}")
-                    progress_bar = st.progress(0, text="等待生成...")
+                    st.caption("模型推理运行在独立 Python 子进程中；如果底层 MLX 崩溃，Web 服务会保留运行并显示断点/报告。")
+                    progress_bar = st.progress(0, text=f"准备开始 0/{len(chunks)}")
+                    process_box = st.empty()
+                    heartbeat_box = st.empty()
+                    log_box = st.empty()
+                    recent_logs: list[str] = []
+                    last_segment_line = ""
+                    generation_started_at = time.monotonic()
+                    current_segment_started_at = generation_started_at
+                    last_completed_count = 0
+                    completed_segment_durations: list[float] = []
 
-                    def on_chunk_done(current: int, total: int, label: str) -> None:
-                        progress_bar.progress(
-                            current / total,
-                            text=f"第 {current}/{total} 段完成: {label}",
+                    def render_progress(elapsed_seconds: float = 0.0, latest_line: str = "") -> None:
+                        nonlocal last_segment_line, current_segment_started_at, last_completed_count
+                        if re.match(r"^\[\d+/\d+\]", latest_line):
+                            last_segment_line = latest_line
+                            current_segment_started_at = time.monotonic()
+                        snapshot = _generation_progress_snapshot(output_path, checkpoint_path, len(chunks))
+                        completed = snapshot["completed"]
+                        total = snapshot["total"]
+                        current = snapshot["current"]
+                        now = time.monotonic()
+                        if completed > last_completed_count:
+                            segment_elapsed = max(0.0, now - current_segment_started_at)
+                            completed_segment_durations.extend([segment_elapsed] * (completed - last_completed_count))
+                            current_segment_started_at = now
+                            last_completed_count = completed
+                        current_segment_elapsed = max(0.0, now - current_segment_started_at)
+                        estimate = _estimated_generation_progress(
+                            completed=completed,
+                            total=total,
+                            elapsed_seconds=elapsed_seconds,
+                            current_segment_elapsed=current_segment_elapsed,
+                            completed_segment_durations=completed_segment_durations,
                         )
+                        ratio = float(estimate["ratio"] or 0.0)
+                        if completed >= total and total:
+                            label = f"已完成 {completed}/{total} 段"
+                        else:
+                            label = f"估算进度 {ratio * 100:.0f}% | 正在生成第 {current}/{total} 段，已完成 {completed}/{total} 段"
+                        progress_bar.progress(ratio, text=label)
+                        heartbeat_parts = [
+                            f"运行中: {_format_elapsed(elapsed_seconds)}",
+                            f"预计剩余: {_format_eta(estimate['remaining_seconds'])}",
+                            label,
+                        ]
+                        if snapshot["segment_count"]:
+                            heartbeat_parts.append(f"已写入 segment 文件: {snapshot['segment_count']}")
+                        if last_segment_line:
+                            heartbeat_parts.append(f"最近段落: {last_segment_line}")
+                        heartbeat_box.info(" | ".join(heartbeat_parts))
 
-                    result = generate_podcast(
-                        model=model,
-                        backend=backend,
-                        ref_audio_path=str(ref_audio_path),
-                        ref_text=ref_text,
+                    def on_process(pid: int) -> None:
+                        process_box.info(f"生成子进程 PID: {pid}")
+
+                    def on_log(line: str) -> None:
+                        recent_logs.append(line)
+                        render_progress(elapsed_seconds=time.monotonic() - generation_started_at, latest_line=line)
+                        log_text = html.escape("\n".join(recent_logs[-40:]))
+                        log_box.markdown(f'<pre class="generation-log">{log_text}</pre>', unsafe_allow_html=True)
+
+                    def on_heartbeat(elapsed_seconds: float, latest_line: str) -> None:
+                        render_progress(elapsed_seconds=elapsed_seconds, latest_line=latest_line)
+
+                    result = _run_generation_subprocess(
                         target_text=target_text,
-                        output_path=str(output_path),
-                        speed=speed,
+                        ref_audio_path=ref_audio_path,
+                        ref_text=ref_text,
+                        output_path=output_path,
+                        backend=backend,
+                        model_ref=model_ref,
+                        speed=effective_speed,
                         temperature=temperature,
                         chunk_max_chars=chunk_max_chars,
-                        checkpoint_path=str(checkpoint_path),
+                        checkpoint_path=checkpoint_path,
                         checkpoint_metadata=profile_metadata,
                         output_format=output_format,
                         normalise=normalise,
-                        keep_segments=True,
-                        model_ref=model_ref,
-                        progress_callback=on_chunk_done,
+                        resume=resume,
+                        log_callback=on_log,
+                        process_callback=on_process,
+                        heartbeat_callback=on_heartbeat,
                     )
-                    if not result:
-                        raise RuntimeError(_generation_failure_message(output_path, output_path))
-                    progress_bar.empty()
                     status.update(label="生成完成", state="complete", expanded=False)
 
-                final_path = Path(result)
+                final_path = result
                 final_mime = "audio/mpeg" if final_path.suffix.lower() == ".mp3" else "audio/wav"
                 st.success(f"已保存音频: {final_path}")
                 st.audio(str(final_path), format=final_mime)
