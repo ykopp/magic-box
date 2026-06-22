@@ -22,6 +22,7 @@ from utils import (
     limit_audio_peak,
     prepare_reference_pair,
     prepare_reference_audio_clip,
+    reduce_sibilance,
     remove_dc_offset,
     sanitise_tts_text,
     smooth_sample_jumps,
@@ -257,6 +258,32 @@ class AudioHealthTest(unittest.TestCase):
         warnings = check_audio_health(limited, SAMPLE_RATE)
 
         self.assertFalse(any("near clipping" in warning for warning in warnings))
+
+    def test_reduce_sibilance_softens_high_frequency_burst(self):
+        t = np.arange(SAMPLE_RATE, dtype=np.float32) / SAMPLE_RATE
+        low_voice = 0.08 * np.sin(2 * np.pi * 800 * t)
+        sibilant = np.zeros_like(low_voice)
+        burst = (t >= 0.35) & (t <= 0.55)
+        sibilant[burst] = 0.20 * np.sin(2 * np.pi * 6500 * t[burst])
+        audio = (low_voice + sibilant).astype(np.float32)
+
+        repaired, stats = reduce_sibilance(audio, SAMPLE_RATE)
+
+        self.assertGreater(stats["attenuated_frames"], 0)
+        before_fft = np.fft.rfft(audio[burst])
+        after_fft = np.fft.rfft(repaired[burst])
+        freqs = np.fft.rfftfreq(int(np.count_nonzero(burst)), d=1 / SAMPLE_RATE)
+        s_band = (freqs >= 5000) & (freqs <= 8000)
+        self.assertLess(float(np.mean(np.abs(after_fft[s_band]))), float(np.mean(np.abs(before_fft[s_band]))))
+
+    def test_reduce_sibilance_preserves_normal_low_voice(self):
+        t = np.arange(SAMPLE_RATE, dtype=np.float32) / SAMPLE_RATE
+        audio = (0.08 * np.sin(2 * np.pi * 800 * t)).astype(np.float32)
+
+        repaired, stats = reduce_sibilance(audio, SAMPLE_RATE)
+
+        self.assertEqual(stats["attenuated_frames"], 0)
+        np.testing.assert_allclose(repaired, audio, atol=1e-3)
 
     def test_smooth_sample_jumps_repairs_short_clicks(self):
         audio = np.full(100, 0.1, dtype=np.float32)

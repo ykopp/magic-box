@@ -44,6 +44,7 @@ from utils import (
     load_checkpoint,
     make_output_filename,
     normalise_loudness,
+    reduce_sibilance,
     remove_dc_offset,
     sanitise_tts_text,
     save_checkpoint,
@@ -712,6 +713,12 @@ def generate_podcast(
     if normalise:
         print("\n🔊 响度标准化 (-23 LUFS，软限幅 0.95 peak)…")
         final_audio = normalise_loudness(final_audio, final_sample_rate)
+    final_audio, deess_stats = reduce_sibilance(final_audio, final_sample_rate)
+    if int(deess_stats.get("attenuated_frames", 0) or 0) > 0:
+        print(
+            "🫧 De-esser: softened "
+            f"{deess_stats['attenuated_frames']}/{deess_stats['processed_frames']} high-sibilance frames"
+        )
     final_audio = limit_audio_peak(final_audio)
     final_audio, post_loudness_declick = smooth_sample_jumps(final_audio, threshold=0.5, radius=2)
     if int(post_loudness_declick.get("repaired_jumps", 0) or 0) > 0:
@@ -727,6 +734,7 @@ def generate_podcast(
     quality_report["final"]["output_warnings"] = output_warnings
     quality_report["final"]["output_issues"] = output_issues
     quality_report["final"]["output_diagnostics"] = []
+    quality_report["final"]["deess"] = deess_stats
     quality_report["final"]["post_loudness_declick"] = post_loudness_declick
 
     # -- Save output -------------------------------------------------------
@@ -831,7 +839,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="参考音频文本（参考音频里说的内容）",
     )
-    parser.add_argument("--speed", "-s", type=float, default=1.0, help="语速倍率 (默认 1.00；Qwen clone 会按参考音频语速校准)")
+    parser.add_argument("--speed", "-s", type=float, default=0.90, help="语速倍率 (默认 0.90；Qwen clone 会按参考音频语速校准)")
     parser.add_argument("--temperature", type=float, default=1.0, help="随机性 (默认 1.0)")
     parser.add_argument("--no-normalise", action="store_true", help="跳过响度标准化")
     parser.add_argument(

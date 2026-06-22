@@ -65,8 +65,8 @@ class StreamlitModelFilteringTest(unittest.TestCase):
         self.assertEqual(_filter_model_choices_for_clone("voxcpm", choices), choices)
 
     def test_qwen_display_speed_uses_slightly_slower_generation_speed(self):
-        self.assertEqual(_effective_generation_speed("qwen", 1.0), 0.9)
-        self.assertEqual(_effective_generation_speed("qwen", 0.95), 0.855)
+        self.assertEqual(_effective_generation_speed("qwen", 1.0), 0.82)
+        self.assertEqual(_effective_generation_speed("qwen", 0.95), 0.779)
         self.assertEqual(_effective_generation_speed("voxcpm", 1.0), 1.0)
 
     def test_default_index_uses_filtered_base_choices(self):

@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref-text", help="Reference transcript when not using --profile.")
     parser.add_argument("--backend", default="qwen", choices=["qwen", "voxcpm"])
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--speed", type=float, default=0.90)
+    parser.add_argument("--speed", type=float, default=0.82)
     parser.add_argument("--temperature", type=float, default=0.85)
     parser.add_argument("--chunk-max-chars", type=int, default=260)
     parser.add_argument("--format", default="mp3", choices=["mp3", "wav", "both"])

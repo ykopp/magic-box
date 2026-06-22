@@ -2,7 +2,7 @@
 
 > 最后更新：2026-06-22
 
-当前版本：V2.3.1
+当前版本：V2.3.2
 
 Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS** 和 **VoxCPM2** 两个 MLX 原生后端。
 
@@ -14,6 +14,14 @@ Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS**
 > 本目录是经过 2026-06-17 合并整理后的唯一工作目录。原 `/Users/liuchang/Workspaces/Apprun/chenxi/Magic Box/`（旧 V2.0.0）已被删除，所有代码 / 配置已合并到本目录；原 `/Users/liuchang/Apprun/chenxi/Magic Box/`（旧 V1.5.7）已被本目录的 V2.0.0 内容覆盖。完整备份在 `~/MagicBox-Backup-20260617/`。
 
 ## 最近更新
+
+### v2.3.2（2026-06-22 齿音压制 + 更慢默认语速）
+
+- **Qwen 默认语速再降一档**：Web 端 Qwen 显示语速按 `0.82` 折算后传给生成器；显示 `1.00` 实际传入 `0.82`，显示 `0.95` 实际传入 `0.779`。Skill / Hermes wrapper 默认同样使用 `0.82`。
+- **最终音频加保守 de-esser**：响度标准化后会对 4.5-9.5 kHz 的异常高频齿音做轻量压制，缓解 “si / 思思 / 丝丝” 一类破音，同时保留正常人声亮度。
+- **CLI 默认更稳**：直接使用 `podcast_generator.py` 时默认 `--speed` 从 `1.00` 调整为 `0.90`。
+
+测试覆盖增至 **122**，新增齿音压制回归测试。
 
 ### v2.3.1（2026-06-22 GitHub 部署 + Hermes 同步）
 
@@ -29,7 +37,7 @@ Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS**
 - **常驻生成监控**（`streamlit_app.py`）：切分预览上方会显示当前后台生成进程 PID、运行时间、CPU、已完成段数、segment 文件数、估算进度和预计剩余时间；页面会定时刷新监控，不再只依赖按钮点击后的临时状态块。
 - **防重复启动**（`streamlit_app.py`）：有任何 `podcast_generator.py` 正在生成时，“生成播客音频”按钮会禁用，避免多个 Qwen / VoxCPM 子进程同时抢 CPU、内存或写 checkpoint。
 - **默认断点续跑开启**：Web 端“从断点继续”默认打开。长文生成中断后，保持同一个输出文件名即可续跑已完成片段。
-- **Qwen 默认语速更慢**：Web 端 Qwen 显示语速会按 `0.90` 折算后传给生成器；显示 `1.00` 实际传入 `0.90`，显示 `0.95` 实际传入 `0.855`。生成器仍会在 CLI 内按参考音频语速做二次校准，并把最终 `model_speed` 写入 checkpoint / quality report。
+- **Qwen 默认语速更慢**：Web 端 Qwen 显示语速会按 `0.82` 折算后传给生成器；显示 `1.00` 实际传入 `0.82`，显示 `0.95` 实际传入 `0.779`。生成器仍会在 CLI 内按参考音频语速做二次校准，并把最终 `model_speed` 写入 checkpoint / quality report。
 - **CLI 与 Web 参数统一**（`podcast_generator.py`）：CLI 增加 `--chunk-max-chars` 和 `--checkpoint-metadata-file`，Web 子进程调用可以完整传递切分上限、Profile 指纹、断点元数据和输出格式。
 
 相关 UI / 子进程测试覆盖增至 **120**，包含子进程异常尾日志、进度快照、ETA 估算、进程时间解析、Qwen 显示语速折算和后台进程扫描。
@@ -177,7 +185,7 @@ Streamlit 页面用于正式长文播客生产：
 - 粘贴、上传 TXT（UTF-8 / GB18030，上限 50 MB），或从 URL 抽取文章正文，清除广告、订阅、分享等网页杂质后整理成播客稿。
 - 在 Qwen 和 VoxCPM2 两个后端间切换。Qwen 支持 speed / temperature / 模型路由；VoxCPM2 输出 48 kHz 高保真音频。
 - 选择已保存的"克隆声音 Profile"，或临时上传参考音频。
-- 使用"表达预设"（稳定清晰 / 自然播客 / 热情开场 / 沉稳叙事 / 快速草稿）和高级微调控制语速、随机性和单段字符上限；Web 端 Qwen 显示语速会先按 `0.90` 折算，再交给生成器按参考音频语速校准。
+- 使用"表达预设"（稳定清晰 / 自然播客 / 热情开场 / 沉稳叙事 / 快速草稿）和高级微调控制语速、随机性和单段字符上限；Web 端 Qwen 显示语速会先按 `0.82` 折算，再交给生成器按参考音频语速校准。
 - 输出 WAV、MP3，或同时输出 WAV + MP3。
 - "从断点继续"默认开启，中断任务可按同一输出文件名续跑。断点文件 fingerprint 已改为内容哈希，跨机器可复用。
 - 生成过程中页面会显示常驻进度监控：子进程 PID、运行时间、CPU、当前段、已完成段、segment 文件数、估算进度和预计剩余时间。
@@ -349,6 +357,7 @@ v2.1.0 起，生成链路在以下节点强制校验，避免无声失败、断�
 | 静默裁剪 | `trim_silence` head/tail 守卫 | chunk 短于 head+tail 请求量 | warning + 保留原音频,避免整段被吞 |
 | 交叉淡化 | `crossfade_concat` 动态 fade 收缩 | 段长度 < fade 窗口 | 自动收缩到 `min(requested, len(out), len(s))`,仅 sub-ms 退化到硬切 |
 | 响度限幅 | `limit_audio_peak(ceiling=0.95)` + `check_audio_health(threshold=0.95)` | peak ≥ 0.95 | tanh 软限,失败时立刻告警 |
+| 齿音压制 | `reduce_sibilance` | 4.5-9.5 kHz 高频齿音占比异常 | 轻量压制 “si/思思/丝丝” 一类尖锐破音 |
 | ffmpeg 依赖 | `convert_audio_if_needed` / `convert_wav_to_mp3` | 缺少 ffmpeg | 两者一致 `raise RuntimeError("brew install ffmpeg")` |
 
 历史音频问题已经收敛进当前生成链路：优先使用 Qwen bf16/Base 克隆模型、保留真实 sample rate、拼接前后做健康检查、以 -23 LUFS 做保守响度标准化，并在质量报告中记录参考语速校准、sample jumps、低能量段和最终交付文件指标。
@@ -377,7 +386,7 @@ voices/profiles/        # 用户保存的声音 Profile
 outputs/                # 生成结果、quality_report.json、.<output>_segments/
 models/                 # 本地模型
 runtime/                # 临时上传文件
-tests/                  # 单元测试 (120 个)
+tests/                  # 单元测试 (122 个)
 使用指南.md             # 中文使用指南（保留自 V1.5.7）
 项目交接文档.md         # 项目交接文档（保留自 V1.5.7）
 ```

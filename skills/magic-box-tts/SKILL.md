@@ -32,7 +32,7 @@ Defaults are production-oriented:
 
 - backend `qwen`
 - format `mp3`
-- speed `0.90`
+- speed `0.82`
 - temperature `0.85`
 - chunk max chars `260`
 - resume enabled

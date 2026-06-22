@@ -1039,6 +1039,119 @@ def limit_audio_peak(audio: np.ndarray, ceiling: float = 0.95) -> np.ndarray:
     return saturated
 
 
+def reduce_sibilance(
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    *,
+    band_low_hz: float = 4500.0,
+    band_high_hz: float = 9500.0,
+    ratio_threshold: float = 0.18,
+    max_reduction_db: float = 4.5,
+    frame_size: int = 2048,
+    hop_size: int = 512,
+) -> tuple[np.ndarray, dict[str, int | float]]:
+    """Conservatively reduce sharp high-frequency sibilance.
+
+    Qwen clone voices can over-emphasise Chinese "si/思思/丝丝" sounds. This
+    is a small spectral de-esser: only frames whose 4.5-9.5 kHz energy is
+    unusually high are attenuated in that band. It is intentionally weaker
+    than a general EQ so normal brightness and intelligibility are preserved.
+    """
+    arr = np.asarray(audio, dtype=np.float32)
+    stats: dict[str, int | float] = {
+        "processed_frames": 0,
+        "attenuated_frames": 0,
+        "band_low_hz": float(band_low_hz),
+        "band_high_hz": float(band_high_hz),
+        "max_reduction_db": float(max_reduction_db),
+    }
+    if arr.size == 0 or sample_rate <= 0:
+        return arr, stats
+
+    mono = arr
+    was_1d = mono.ndim == 1
+    if mono.ndim == 2:
+        mono = np.mean(mono, axis=1, dtype=np.float32)
+    elif mono.ndim != 1:
+        return arr, stats
+
+    n = int(mono.size)
+    if n < frame_size:
+        frame_size = 1 << max(5, int(math.floor(math.log2(max(n, 32)))))
+        hop_size = max(16, frame_size // 4)
+    if frame_size <= 0 or hop_size <= 0 or n == 0:
+        return arr, stats
+
+    pad = frame_size
+    padded = np.pad(mono.astype(np.float32, copy=False), (0, pad), mode="constant")
+    output = np.zeros_like(padded, dtype=np.float32)
+    weights = np.zeros_like(padded, dtype=np.float32)
+    window = np.hanning(frame_size).astype(np.float32)
+    if not np.any(window):
+        window = np.ones(frame_size, dtype=np.float32)
+
+    freqs = np.fft.rfftfreq(frame_size, d=1.0 / float(sample_rate))
+    band_mask = (freqs >= band_low_hz) & (freqs <= min(band_high_hz, sample_rate / 2.0))
+    if not np.any(band_mask):
+        return arr, stats
+
+    max_reduction = float(10 ** (-abs(max_reduction_db) / 20.0))
+    eps = 1e-12
+    frame_plan: list[tuple[int, np.ndarray, float | None]] = []
+    for start in range(0, max(1, n), hop_size):
+        frame = padded[start : start + frame_size]
+        if frame.size < frame_size:
+            frame = np.pad(frame, (0, frame_size - frame.size), mode="constant")
+        windowed = frame * window
+        spectrum = np.fft.rfft(windowed)
+        power = np.abs(spectrum) ** 2
+        total_power = float(np.sum(power) + eps)
+        band_ratio = float(np.sum(power[band_mask]) / total_power)
+        frame_rms = float(np.sqrt(np.mean(windowed * windowed) + eps))
+
+        gain: float | None = None
+        if band_ratio > ratio_threshold and frame_rms > 1e-4:
+            excess = min(1.0, (band_ratio - ratio_threshold) / max(ratio_threshold, eps))
+            gain = max(max_reduction, 1.0 - (1.0 - max_reduction) * excess)
+        frame_plan.append((start, spectrum, gain))
+        if start + frame_size >= n + hop_size:
+            break
+
+    candidate_count = sum(1 for _, _, gain in frame_plan if gain is not None)
+    frame_count = len(frame_plan)
+    # If almost every frame is "sibilant", it is probably a globally bright
+    # or synthetic signal, not short consonant harshness. Avoid changing the
+    # whole file; the limiter/de-click stages will handle genuine clipping.
+    if frame_count and candidate_count / frame_count > 0.65:
+        stats["processed_frames"] = frame_count
+        stats["attenuated_frames"] = 0
+        stats["skipped_global_high_frequency"] = 1
+        return arr, stats
+
+    attenuated = 0
+    for start, spectrum, gain in frame_plan:
+        if gain is not None:
+            spectrum[band_mask] *= gain
+            attenuated += 1
+        repaired = np.fft.irfft(spectrum, n=frame_size).astype(np.float32)
+        output[start : start + frame_size] += repaired * window
+        weights[start : start + frame_size] += window * window
+
+    valid = weights > 1e-8
+    output[valid] = output[valid] / weights[valid]
+    output[~valid] = padded[~valid]
+    processed = output[:n].astype(np.float32, copy=False)
+    stats["processed_frames"] = frame_count
+    stats["attenuated_frames"] = attenuated
+
+    if not was_1d and arr.ndim == 2:
+        # Apply the same de-essed mono correction proportionally to every channel.
+        original_mono = mono[:n]
+        correction = processed - original_mono
+        return (arr[:n] + correction[:, None]).astype(np.float32), stats
+    return processed, stats
+
+
 def remove_dc_offset(audio: np.ndarray) -> np.ndarray:
     """Subtract the mean so the waveform is centred around 0.
 
