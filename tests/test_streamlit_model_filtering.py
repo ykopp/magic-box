@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from streamlit_app import (
+    _active_generation_processes,
     _can_generate_with_reference_quality,
     _build_generation_command,
     _call_optional_reference_audit,
@@ -228,8 +229,23 @@ class StreamlitModelFilteringTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--chunk-max-chars") + 1], "260")
         self.assertIn("--checkpoint-metadata-file", cmd)
         self.assertEqual(cmd[cmd.index("--checkpoint-metadata-file") + 1], "/tmp/meta.json")
+        self.assertIn("--force-exit-after-run", cmd)
         self.assertIn("--no-normalise", cmd)
         self.assertIn("--resume", cmd)
+
+    def test_active_generation_processes_finds_all_generator_children(self):
+        ps_output = """
+        111 10 R+ 12.5 0.3 03:04 /python -u /repo/podcast_generator.py --output /tmp/a.mp3
+        222 10 S+ 1.0 0.1 00:01 /python -m streamlit run streamlit_app.py
+        333 10 R+ 9.0 0.2 1-02:03:04 /python -u /repo/podcast_generator.py --output /tmp/b.mp3
+        """
+
+        with patch("streamlit_app.subprocess.check_output", return_value=ps_output):
+            processes = _active_generation_processes()
+
+        self.assertEqual([process["pid"] for process in processes], [111, 333])
+        self.assertEqual(processes[0]["elapsed_seconds"], 184)
+        self.assertEqual(processes[1]["elapsed_seconds"], 93784)
 
     def test_generation_subprocess_nonzero_exit_reports_tail(self):
         class FakeProcess:

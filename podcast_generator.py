@@ -855,6 +855,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-max-chars", type=int, default=80, help="每段最大字符数 (默认 80)")
     parser.add_argument(
+        "--force-exit-after-run",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--model", "-m",
         default=MODEL_PATH,
         help="模型路径（默认 1.7B-Base）",
@@ -926,7 +931,7 @@ def main():
                 checkpoint_metadata = json.load(f)
         except Exception as exc:
             print(f"✗ 断点元数据读取失败: {exc}")
-            sys.exit(1)
+            return 1
 
     # -- Model -------------------------------------------------------------
     print(f"\n{'=' * 60}")
@@ -965,12 +970,17 @@ def main():
         model_ref=args.model,
     )
     if not result:
-        sys.exit(1)
+        return 1
+    if args.force_exit_after_run:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except KeyboardInterrupt:
         print("\n中断。", file=sys.stderr)
         sys.exit(130)

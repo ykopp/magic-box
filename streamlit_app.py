@@ -537,6 +537,7 @@ def _build_generation_command(
         str(metadata_path),
         "--format",
         output_format,
+        "--force-exit-after-run",
     ]
     if not normalise:
         command.append("--no-normalise")
@@ -769,7 +770,7 @@ def _parse_process_etime(etime: str) -> float | None:
         return None
 
 
-def _generation_process_snapshot(output_path: Path) -> dict[str, Any] | None:
+def _active_generation_processes() -> list[dict[str, Any]]:
     try:
         output = subprocess.check_output(
             ["ps", "-axo", "pid=,ppid=,stat=,pcpu=,pmem=,etime=,command="],
@@ -778,11 +779,11 @@ def _generation_process_snapshot(output_path: Path) -> dict[str, Any] | None:
             errors="replace",
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return []
 
-    output_token = str(output_path)
+    processes: list[dict[str, Any]] = []
     for line in output.splitlines():
-        if "podcast_generator.py" not in line or output_token not in line:
+        if "podcast_generator.py" not in line:
             continue
         parts = line.strip().split(None, 6)
         if len(parts) < 7:
@@ -792,7 +793,7 @@ def _generation_process_snapshot(output_path: Path) -> dict[str, Any] | None:
             pid_value = int(pid)
         except ValueError:
             continue
-        return {
+        processes.append({
             "pid": pid_value,
             "ppid": ppid,
             "stat": stat,
@@ -801,7 +802,15 @@ def _generation_process_snapshot(output_path: Path) -> dict[str, Any] | None:
             "etime": etime,
             "elapsed_seconds": _parse_process_etime(etime),
             "command": command,
-        }
+        })
+    return processes
+
+
+def _generation_process_snapshot(output_path: Path) -> dict[str, Any] | None:
+    output_token = str(output_path)
+    for process in _active_generation_processes():
+        if output_token in process["command"]:
+            return process
     return None
 
 
@@ -1826,15 +1835,19 @@ def main() -> None:
         st.info("输入、导入或抽取稿件后可预览切分结果。")
 
     reference_can_generate = _can_generate_with_reference_quality(reference_quality_status)
+    active_generations = _active_generation_processes()
     active_generation = _generation_process_snapshot(output_path)
     generate = st.button(
         "生成播客音频",
         type="primary",
         use_container_width=True,
-        disabled=not reference_can_generate or active_generation is not None,
+        disabled=not reference_can_generate or bool(active_generations),
     )
     if active_generation is not None:
         st.caption(f"当前输出正在生成中，已禁用重复启动。PID: {active_generation['pid']}")
+    elif active_generations:
+        running = ", ".join(str(process["pid"]) for process in active_generations[:3])
+        st.caption(f"已有生成任务正在运行，已禁用新的生成任务。PID: {running}")
     if generate:
         errors = []
         if not target_text:
@@ -1890,7 +1903,7 @@ def main() -> None:
 
                     def render_progress(elapsed_seconds: float = 0.0, latest_line: str = "") -> None:
                         nonlocal last_segment_line, current_segment_started_at, last_completed_count
-                        if re.match(r"^\[\d+/\d+\]", latest_line):
+                        if re.match(r"^\[\d+/\d+\]", latest_line) and latest_line != last_segment_line:
                             last_segment_line = latest_line
                             current_segment_started_at = time.monotonic()
                         snapshot = _generation_progress_snapshot(output_path, checkpoint_path, len(chunks))

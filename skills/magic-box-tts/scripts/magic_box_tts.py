@@ -118,6 +118,7 @@ def build_command(args: argparse.Namespace, text_path: Path, ref_audio: Path, re
         str(checkpoint_path),
         "--format",
         args.format,
+        "--force-exit-after-run",
     ]
     if not args.no_resume:
         command.append("--resume")
