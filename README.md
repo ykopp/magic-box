@@ -181,6 +181,31 @@ python3 podcast_generator.py \
 
 生成默认会在输出目录写入 `quality_report.json`，并保留每段原始 chunk 到 `outputs/.<output_stem>_segments/`。如果质量门禁失败，输出文件不会被当作成功结果返回，但报告和片段证据会保留。
 
+## Codex Skill / Hermes 投递
+
+仓库内置 `skills/magic-box-tts/`，用于把 Magic Box 作为 CLI-first 的音频生成 Skill 使用。它适合在另一台已部署 Magic Box 和 Hermes 的 Mac 上接收文本、调用本机模型生成 MP3，避免当前电脑长时间占用。
+
+本机直接生成：
+
+```bash
+python3 skills/magic-box-tts/scripts/magic_box_tts.py \
+  --file story.txt \
+  --profile 刘畅 \
+  --output outputs/story.mp3
+```
+
+生成一条适合投递给 Hermes / 远程 Mac 执行的命令：
+
+```bash
+python3 skills/magic-box-tts/scripts/magic_box_tts.py \
+  --text "要朗读的正文" \
+  --profile 刘畅 \
+  --output outputs/story.mp3 \
+  --print-command
+```
+
+目标 Mac 需要提前准备好 repo、`.venv`、模型文件、`ffmpeg` 和对应声音 Profile。详细说明见 `skills/magic-box-tts/references/home-mac-setup.md`。
+
 ## 模型与依赖
 
 ### 模型管理
