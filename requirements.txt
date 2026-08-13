@@ -1,5 +1,5 @@
 anyio==4.12.1
-audioop-lts==0.2.2
+audioop-lts==0.2.2; python_version >= "3.13"
 audioread==3.1.0
 blobfile==3.1.0
 certifi==2026.1.4
@@ -9,11 +9,12 @@ click==8.3.1
 decorator==5.2.1
 filelock==3.20.3
 fsspec==2026.1.0
+gradio>=6.5,<7
 h11==0.16.0
-hf-xet==1.2.0
+hf-xet==1.5.0
 httpcore==1.0.9
 httpx==0.28.1
-huggingface_hub==1.3.4
+huggingface_hub==1.21.0
 idna==3.11
 Jinja2==3.1.6
 joblib==1.5.3
@@ -23,10 +24,10 @@ llvmlite==0.46.0
 lxml==6.0.2
 MarkupSafe==3.0.3
 miniaudio==1.61
-mlx==0.30.3
-mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git@9349644ccbd62eb10900852228f7b952c566def3
-mlx-lm==0.30.5
-mlx-metal==0.30.3
+mlx==0.31.2
+mlx-audio==0.4.4
+mlx-lm==0.31.3
+mlx-metal==0.31.2
 msgpack==1.1.2
 numba==0.63.1
 numpy==2.3.5
@@ -51,11 +52,15 @@ soxr==1.0.0
 standard-aifc==3.13.0
 standard-chunk==3.13.0
 standard-sunau==3.13.0
+streamlit>=1.52,<2
 threadpoolctl==3.6.0
 tiktoken==0.12.0
 tokenizers==0.22.2
 tqdm==4.67.1
-transformers==5.0.0rc3
+transformers==5.12.1
 typer-slim==0.21.1
 typing_extensions==4.15.0
 urllib3==2.6.3
+
+# Local verification tools
+pytest>=9,<10

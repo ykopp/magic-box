@@ -1,0 +1,4 @@
+interface:
+  display_name: "Magic Box TTS"
+  short_description: "Generate Magic Box narration audio from text"
+  default_prompt: "Use $magic-box-tts to generate an MP3 narration from this text on my Mac."

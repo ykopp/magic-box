@@ -7,15 +7,35 @@ models/
 # Temp files
 temp_*/
 temp_convert_*.wav
+qwen_tts_*.wav
+*.ckpt
+*.log
+
+# Build artifacts
+build/
+dist/
+pyinstaller_cache/
 
 # User data (keep folder structure)
+audio_samples/*
+!audio_samples/.gitkeep
 voices/*
 !voices/.gitkeep
+!voices/profiles/
+voices/profiles/*
+!voices/profiles/.gitkeep
 outputs/*
 !outputs/.gitkeep
+web*.log
+runtime/*
+!runtime/.gitkeep
 
 # System files
 .DS_Store
 __pycache__/
+.pytest_cache/
+.cache/
+models/**/.cache/
 *.pyc
 *.pyo
+*.egg-info/
