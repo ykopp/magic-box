@@ -13,8 +13,13 @@ import tempfile
 from pathlib import Path
 
 
-DEFAULT_REPO = Path(os.environ.get("MAGIC_BOX_DIR", "/Users/liuchang/Apprun/chenxi/Magic Box"))
-DEFAULT_MODEL = "/Users/liuchang/podcast_generator_models/Qwen3-TTS-12Hz-1.7B-Base-bf16"
+DEFAULT_REPO = Path(
+    os.environ.get("MAGIC_BOX_DIR", str(Path(__file__).resolve().parents[3]))
+)
+DEFAULT_MODEL = os.environ.get(
+    "MAGIC_BOX_MODEL",
+    os.path.join(str(Path.home()), "Models", "Qwen3-TTS-12Hz-1.7B-Base-bf16"),
+)
 
 
 def parse_args() -> argparse.Namespace:

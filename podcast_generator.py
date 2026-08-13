@@ -889,7 +889,7 @@ def main():
     if args.file:
         if not os.path.exists(args.file):
             print(f"✗ 文件不存在: {args.file}")
-            return
+            return 1
         with open(args.file, "r", encoding="utf-8") as f:
             target_text = f.read().strip()
     elif args.text:
@@ -897,22 +897,22 @@ def main():
     else:
         parser.print_help()
         print("\n示例: python podcast_generator.py --file 稿件.txt --ref-audio 我的声音.m4a")
-        return
+        return 1
 
     if not target_text:
         print("✗ 文本内容为空")
-        return
+        return 1
 
     # -- Reference audio ---------------------------------------------------
     if not args.ref_audio:
         print("✗ 请提供参考音频: --ref-audio path/to/your_voice.wav")
-        return
+        return 1
     if not args.ref_text.strip():
         print("✗ 请提供参考音频文本: --ref-text \"参考音频里实际说的内容\"")
-        return
+        return 1
     if not os.path.exists(args.ref_audio):
         print(f"✗ 参考音频不存在: {args.ref_audio}")
-        return
+        return 1
 
     # -- Output path -------------------------------------------------------
     output_path = args.output
@@ -955,7 +955,7 @@ def main():
         model, _ = load_backend_model(args.backend, args.model)
     except Exception as e:
         print(f"✗ 模型加载失败: {e}")
-        return
+        return 1
     print("✓ 模型加载成功")
     if args.backend == "voxcpm":
         print("ℹ VoxCPM 为实验后端：不支持 Qwen 的 speed/temperature 控制，按原生推理参数运行。")

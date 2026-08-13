@@ -11,7 +11,7 @@ Use this when preparing another Mac to run Magic Box generation locally.
 - Qwen model directory available locally, commonly:
 
 ```text
-/Users/liuchang/podcast_generator_models/Qwen3-TTS-12Hz-1.7B-Base-bf16
+/Users/liuchang/Models/Qwen3-TTS-12Hz-1.7B-Base-bf16
 ```
 
 - A saved voice profile copied to:
@@ -34,8 +34,8 @@ curl -fsSL https://raw.githubusercontent.com/ykopp/magic-box/codex/interactive-w
 Equivalent manual setup:
 
 ```bash
-mkdir -p "/Users/liuchang/Apprun/chenxi"
-cd "/Users/liuchang/Apprun/chenxi"
+mkdir -p "/Users/liuchang/Workspaces"
+cd "/Users/liuchang/Workspaces"
 git clone https://github.com/ykopp/magic-box.git "Magic Box"
 cd "Magic Box"
 git checkout codex/interactive-web-app
@@ -52,7 +52,7 @@ Model download and profile transfer are intentionally not automated here because
 After a Magic Box update is pushed, run this on the target Mac:
 
 ```bash
-cd "/Users/liuchang/Apprun/chenxi/Magic Box"
+cd "/Users/liuchang/Workspaces/Magic Box"
 make sync-update
 ```
 
@@ -69,7 +69,7 @@ The sync script pulls the configured branch with `--ff-only`, refreshes `.venv`,
 To run the Streamlit production UI on a Mac:
 
 ```bash
-cd "/Users/liuchang/Apprun/chenxi/Magic Box"
+cd "/Users/liuchang/Workspaces/Magic Box"
 make run-streamlit
 ```
 
@@ -89,10 +89,10 @@ Prefer this over running long generation on the current laptop.
 Example command to send through Hermes:
 
 ```bash
-cd "/Users/liuchang/Apprun/chenxi/Magic Box" && \
+cd "/Users/liuchang/Workspaces/Magic Box" && \
 python3 skills/magic-box-tts/scripts/magic_box_tts.py \
   --text "要朗读的正文" \
-  --profile 刘畅 \
+  --profile 刘畅_复杂鼓点 \
   --output outputs/story.mp3
 ```
 
@@ -101,7 +101,7 @@ To generate an escaped command without running locally:
 ```bash
 python3 skills/magic-box-tts/scripts/magic_box_tts.py \
   --text "要朗读的正文" \
-  --profile 刘畅 \
+  --profile 刘畅_复杂鼓点 \
   --output outputs/story.mp3 \
   --print-command
 ```

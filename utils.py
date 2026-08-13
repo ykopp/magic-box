@@ -62,6 +62,7 @@ def get_smart_path(folder_name: str) -> Optional[str]:
     search_roots = [
         os.path.join(os.getcwd(), folder_name),
         os.path.join(os.getcwd(), "models", folder_name),
+        os.path.join(str(Path.home()), "Models", folder_name),
         os.path.join(str(Path.home()), "podcast_generator_models", folder_name),
     ]
     for full_path in search_roots:

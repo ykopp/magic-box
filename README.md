@@ -11,7 +11,7 @@ Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS**
 - `skills/magic-box-tts/`：Codex/Hermes 友好的 CLI Skill，适合把长音频生成投递到另一台 Apple Silicon Mac。
 - `scripts/bootstrap_mac.sh` / `scripts/sync_update.sh`：新 Mac 部署和后续 GitHub 同步更新入口。
 
-> 本目录是经过 2026-06-17 合并整理后的唯一工作目录。原 `/Users/liuchang/Workspaces/Apprun/chenxi/Magic Box/`（旧 V2.0.0）已被删除，所有代码 / 配置已合并到本目录；原 `/Users/liuchang/Apprun/chenxi/Magic Box/`（旧 V1.5.7）已被本目录的 V2.0.0 内容覆盖。完整备份在 `~/MagicBox-Backup-20260617/`。
+> 本目录是唯一工作目录（当前 v2.3.2）。旧副本 `/Users/liuchang/Apprun/chenxi/Magic Box/`（v1.5.x）已于 2026-08-13 归档为 `/Users/liuchang/Apprun/chenxi/Magic Box.bak-20260813/`（内含旧 `champ` 声线与旧 8-bit 模型，如需可从此恢复）。
 
 ## 最近更新
 
@@ -113,7 +113,7 @@ Magic Box 是 Apple Silicon 上的本地播客 TTS 工具，支持 **Qwen3-TTS**
 ## 快速启动
 
 ```bash
-cd /Users/liuchang/Apprun/chenxi/Magic\ Box
+cd /Users/liuchang/Workspaces/Magic\ Box
 ./.venv/bin/python -m streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8507
 ```
 
@@ -130,7 +130,7 @@ python3 streamlit_app.py
 或使用 Makefile：
 
 ```bash
-cd /Users/liuchang/Apprun/chenxi/Magic\ Box
+cd /Users/liuchang/Workspaces/Magic\ Box
 make run-streamlit
 ```
 
@@ -154,7 +154,7 @@ curl -fsSL https://raw.githubusercontent.com/ykopp/magic-box/codex/interactive-w
 如需自定义目录或分支：
 
 ```bash
-MAGIC_BOX_DIR="$HOME/Apprun/chenxi/Magic Box" \
+MAGIC_BOX_DIR="$HOME/Workspaces/Magic Box" \
 MAGIC_BOX_BRANCH="codex/interactive-web-app" \
 curl -fsSL https://raw.githubusercontent.com/ykopp/magic-box/codex/interactive-web-app/scripts/bootstrap_mac.sh | bash
 ```
@@ -166,7 +166,7 @@ curl -fsSL https://raw.githubusercontent.com/ykopp/magic-box/codex/interactive-w
 每次这边更新并推送 GitHub 后，另一台 Mac 执行：
 
 ```bash
-cd "$HOME/Apprun/chenxi/Magic Box"
+cd "$HOME/Workspaces/Magic Box"
 make sync-update
 ```
 

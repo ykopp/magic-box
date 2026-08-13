@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_URL="${MAGIC_BOX_REPO_URL:-https://github.com/ykopp/magic-box.git}"
 BRANCH="${MAGIC_BOX_BRANCH:-codex/interactive-web-app}"
-INSTALL_DIR="${MAGIC_BOX_DIR:-$HOME/Apprun/chenxi/Magic Box}"
+INSTALL_DIR="${MAGIC_BOX_DIR:-$HOME/Workspaces/Magic Box}"
 PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then

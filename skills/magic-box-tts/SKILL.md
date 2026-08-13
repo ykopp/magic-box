@@ -13,9 +13,9 @@ From the Magic Box checkout:
 
 ```bash
 python3 skills/magic-box-tts/scripts/magic_box_tts.py \
-  --repo "/Users/liuchang/Apprun/chenxi/Magic Box" \
+  --repo "/Users/liuchang/Workspaces/Magic Box" \
   --file story.txt \
-  --profile 刘畅 \
+  --profile 刘畅_复杂鼓点 \
   --output outputs/story.mp3
 ```
 
@@ -24,7 +24,7 @@ For pasted text:
 ```bash
 python3 skills/magic-box-tts/scripts/magic_box_tts.py \
   --text "要朗读的正文" \
-  --profile 刘畅 \
+  --profile 刘畅_复杂鼓点 \
   --output outputs/story.mp3
 ```
 
@@ -40,7 +40,7 @@ Defaults are production-oriented:
 
 ## Workflow
 
-1. Locate the Magic Box checkout. Use `--repo`, `$MAGIC_BOX_DIR`, or the default `/Users/liuchang/Apprun/chenxi/Magic Box`.
+1. Locate the Magic Box checkout. Use `--repo`, `$MAGIC_BOX_DIR`, or the default `/Users/liuchang/Workspaces/Magic Box`.
 2. Use a saved profile with `--profile <id-or-name>` when available. The wrapper reads `reference_clean.wav` plus `reference_clean.txt` or `transcript.txt`.
 3. If no profile exists on the target Mac, require `--ref-audio` and `--ref-text`.
 4. Run generation in the target Mac's local `.venv`; do not use system Python.
@@ -60,9 +60,9 @@ Example command generation:
 
 ```bash
 python3 skills/magic-box-tts/scripts/magic_box_tts.py \
-  --repo "/Users/liuchang/Apprun/chenxi/Magic Box" \
+  --repo "/Users/liuchang/Workspaces/Magic Box" \
   --file story.txt \
-  --profile 刘畅 \
+  --profile 刘畅_复杂鼓点 \
   --output outputs/story.mp3 \
   --print-command
 ```

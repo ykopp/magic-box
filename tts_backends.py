@@ -95,7 +95,7 @@ def validate_mlx_audio_runtime() -> None:
             f"当前 Python 环境的 mlx-audio=={installed}, 低于项目要求 "
             f">={MIN_MLX_AUDIO_VERSION}. 旧版会导致 Qwen speech tokenizer encoder "
             "不可用, 生成音频出现固定空洞/断续。请使用项目虚拟环境启动: "
-            "cd '/Users/liuchang/Apprun/chenxi/Magic Box' && "
+            f"cd '{QWEN_DIR}' && "
             "./.venv/bin/python -m streamlit run streamlit_app.py --server.port 8507"
         )
 
